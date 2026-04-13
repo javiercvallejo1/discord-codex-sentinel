@@ -1,0 +1,21 @@
+{
+  "name": "discord-codex-local",
+  "interface": {
+    "displayName": "Discord Codex Local"
+  },
+  "plugins": [
+    {
+      "name": "discord-codex-assistant",
+      "source": {
+        "source": "local",
+        "path": "./plugins/discord-codex-assistant"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
+

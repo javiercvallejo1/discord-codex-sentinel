@@ -1,0 +1,13 @@
+{
+  "name": "discord-codex-assistant",
+  "version": "0.1.0",
+  "description": "Guided setup and trusted assistant behaviors for Discord Codex Sentinel.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Discord Codex Assistant",
+    "shortDescription": "Guided Discord Codex setup and operation",
+    "longDescription": "Codex-native setup and operator skills for a non-technical Discord user workflow.",
+    "developerName": "discord-codex-sentinel",
+    "category": "Productivity"
+  }
+}
