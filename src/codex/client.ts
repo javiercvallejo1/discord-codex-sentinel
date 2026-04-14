@@ -1,4 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
+import {
+  execFileSync,
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process"
 import { createInterface } from "node:readline"
 import { EventEmitter } from "node:events"
 import { Logger } from "../state/logger"
@@ -48,9 +52,10 @@ export class CodexAppServerClient extends EventEmitter {
       return
     }
 
+    const args = this.getAppServerArgs()
     this.child = spawn(
       this.codexBin,
-      ["app-server", "--listen", "stdio://", "--session-source", "cli"],
+      args,
       {
         stdio: "pipe",
       },
@@ -224,5 +229,29 @@ export class CodexAppServerClient extends EventEmitter {
     }
     this.pending.delete(message.id)
     pending.reject(new Error(message.error.message))
+  }
+
+  private getAppServerArgs() {
+    const args = ["app-server", "--listen", "stdio://"]
+
+    if (this.supportsSessionSourceFlag()) {
+      args.push("--session-source", "cli")
+    } else {
+      void this.logger.warn("app-server does not advertise --session-source; starting without it")
+    }
+
+    return args
+  }
+
+  private supportsSessionSourceFlag() {
+    try {
+      const help = execFileSync(this.codexBin, ["app-server", "--help"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+      return help.includes("--session-source")
+    } catch {
+      return true
+    }
   }
 }
