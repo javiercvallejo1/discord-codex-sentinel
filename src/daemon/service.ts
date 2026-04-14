@@ -56,6 +56,7 @@ interface ActiveTurn {
   lastUserText: string
   workingMessageId: string | null
   flushTimer: ReturnType<typeof setTimeout> | null
+  typingTimer: ReturnType<typeof setInterval> | null
   activityMessages: Map<string, { kind: "command" | "file"; text: string; messageId: string | null }>
 }
 
@@ -409,6 +410,7 @@ export class DiscordCodexSentinelService {
       lastUserText: text,
       workingMessageId: null,
       flushTimer: null,
+      typingTimer: this.startTypingLoop(runtime),
       activityMessages: new Map(),
     }
     runtime.session.active_turn_id = response.turn.id
@@ -568,6 +570,7 @@ export class DiscordCodexSentinelService {
         lastUserText: "",
         workingMessageId: null,
         flushTimer: null,
+        typingTimer: this.startTypingLoop(runtime),
         activityMessages: new Map(),
       }
     }
@@ -586,6 +589,10 @@ export class DiscordCodexSentinelService {
 
     if (runtime.activeTurn) {
       const completedTurn = runtime.activeTurn
+      if (completedTurn.typingTimer) {
+        clearInterval(completedTurn.typingTimer)
+        completedTurn.typingTimer = null
+      }
       const fullReply = completedTurn.replyText.trim()
       if (completedTurn.workingMessageId) {
         await this.flushWorkingMessage(runtime, true)
@@ -653,7 +660,7 @@ export class DiscordCodexSentinelService {
     if (!runtime.activeTurn) return
     if (runtime.activeTurn.flushTimer) return
     runtime.activeTurn.flushTimer = setTimeout(() => {
-      void this.flushWorkingMessage(runtime)
+      void this.emitProgressHint(runtime)
     }, 750)
   }
 
@@ -662,6 +669,10 @@ export class DiscordCodexSentinelService {
     if (runtime.activeTurn.flushTimer) {
       clearTimeout(runtime.activeTurn.flushTimer)
       runtime.activeTurn.flushTimer = null
+    }
+
+    if (!runtime.activeTurn.workingMessageId) {
+      return
     }
 
     const working = await this.getOrCreateWorkingMessage(runtime)
@@ -691,6 +702,26 @@ export class DiscordCodexSentinelService {
     runtime.session.last_working_message_id = created.id
     await writeBotSessionState(runtime.name, runtime.session)
     return created
+  }
+
+  private startTypingLoop(runtime: RuntimeBot) {
+    const timer = setInterval(() => {
+      void this.emitProgressHint(runtime)
+    }, 4000)
+
+    return timer
+  }
+
+  private async emitProgressHint(runtime: RuntimeBot) {
+    if (!runtime.activeTurn) return
+    if (runtime.activeTurn.flushTimer) {
+      clearTimeout(runtime.activeTurn.flushTimer)
+      runtime.activeTurn.flushTimer = null
+    }
+
+    const channel = await this.getDmChannel(runtime).catch(() => null)
+    if (!channel) return
+    await channel.sendTyping().catch(() => {})
   }
 
   private async createApprovalPrompt(
