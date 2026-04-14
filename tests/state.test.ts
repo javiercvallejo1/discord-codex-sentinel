@@ -20,9 +20,8 @@ describe("renderer helpers", () => {
     expect(chunks.every(chunk => chunk.length <= 3500)).toBe(true)
   })
 
-  test("renderWorkingMessage includes both plan and reply", () => {
+  test("renderWorkingMessage prefers natural reply text", () => {
     const rendered = renderWorkingMessage("Do work", "Done")
-    expect(rendered).toContain("**Plan**")
-    expect(rendered).toContain("**Reply**")
+    expect(rendered).toBe("Done")
   })
 })

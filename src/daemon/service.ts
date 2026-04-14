@@ -379,6 +379,8 @@ export class DiscordCodexSentinelService {
     if (!text) return
 
     const threadId = await this.ensureThread(runtime)
+    const channel = await this.getDmChannel(runtime)
+    await channel.sendTyping().catch(() => {})
 
     if (runtime.activeTurn && runtime.session.active_turn_id) {
       runtime.activeTurn.lastUserText = runtime.activeTurn.lastUserText
@@ -405,16 +407,13 @@ export class DiscordCodexSentinelService {
       planText: "",
       replyText: "",
       lastUserText: text,
-      workingMessageId: runtime.session.last_working_message_id,
+      workingMessageId: null,
       flushTimer: null,
       activityMessages: new Map(),
     }
     runtime.session.active_turn_id = response.turn.id
     runtime.session.last_status = "running"
     await writeBotSessionState(runtime.name, runtime.session)
-
-    await this.getOrCreateWorkingMessage(runtime)
-    await this.flushWorkingMessage(runtime)
     await this.logger.info(`started turn ${response.turn.id} for ${runtime.name}`)
   }
 
@@ -567,7 +566,7 @@ export class DiscordCodexSentinelService {
         planText: "",
         replyText: "",
         lastUserText: "",
-        workingMessageId: runtime.session.last_working_message_id,
+        workingMessageId: null,
         flushTimer: null,
         activityMessages: new Map(),
       }
@@ -587,10 +586,23 @@ export class DiscordCodexSentinelService {
 
     if (runtime.activeTurn) {
       const completedTurn = runtime.activeTurn
-      await this.flushWorkingMessage(runtime, true)
       const fullReply = completedTurn.replyText.trim()
+      if (completedTurn.workingMessageId) {
+        await this.flushWorkingMessage(runtime, true)
+      } else if (fullReply) {
+        const channel = await this.getDmChannel(runtime)
+        const chunks = chunkText(fullReply)
+        if (chunks.length > 0) {
+          const first = await channel.send(chunks[0]!)
+          runtime.session.last_working_message_id = first.id
+          await writeBotSessionState(runtime.name, runtime.session)
+          for (const chunk of chunks.slice(1)) {
+            await channel.send(chunk)
+          }
+        }
+      }
       const chunks = chunkText(fullReply)
-      if (chunks.length > 1) {
+      if (completedTurn.workingMessageId && chunks.length > 1) {
         const channel = await this.getDmChannel(runtime)
         for (const chunk of chunks.slice(1)) {
           await channel.send(chunk)
@@ -656,21 +668,6 @@ export class DiscordCodexSentinelService {
     const content = renderWorkingMessage(runtime.activeTurn.planText, runtime.activeTurn.replyText)
     await working.edit(content)
 
-    for (const [itemId, activity] of runtime.activeTurn.activityMessages) {
-      const channel = await this.getDmChannel(runtime)
-      const text = `**${activity.kind === "command" ? "Command output" : "File activity"}**\n\`\`\`\n${activity.text.slice(-1400) || "..." }\n\`\`\``
-      if (!activity.messageId) {
-        const msg = await channel.send(text)
-        activity.messageId = msg.id
-      } else {
-        const existing = await channel.messages.fetch(activity.messageId).catch(() => null)
-        if (existing) {
-          await existing.edit(text)
-        }
-      }
-      runtime.activeTurn.activityMessages.set(itemId, activity)
-    }
-
     if (final) {
       runtime.session.last_working_message_id = working.id
       await writeBotSessionState(runtime.name, runtime.session)
@@ -679,7 +676,7 @@ export class DiscordCodexSentinelService {
 
   private async getOrCreateWorkingMessage(runtime: RuntimeBot) {
     const channel = await this.getDmChannel(runtime)
-    const existingId = runtime.activeTurn?.workingMessageId ?? runtime.session.last_working_message_id
+    const existingId = runtime.activeTurn?.workingMessageId ?? null
     if (existingId) {
       const existing = await channel.messages.fetch(existingId).catch(() => null)
       if (existing) {

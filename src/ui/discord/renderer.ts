@@ -7,26 +7,18 @@ import {
 const MAX_DISCORD_MESSAGE = 3500
 
 export function renderWorkingMessage(plan: string, reply: string) {
-  const parts: string[] = []
+  if (reply.trim()) {
+    if (reply.length <= MAX_DISCORD_MESSAGE) {
+      return reply.trim()
+    }
+    return `${reply.trim().slice(0, MAX_DISCORD_MESSAGE - 18)}\n\n_(truncated)_`
+  }
 
   if (plan.trim()) {
-    parts.push(`**Plan**\n${plan.trim()}`)
+    return "_Thinking..._"
   }
 
-  if (reply.trim()) {
-    parts.push(`**Reply**\n${reply.trim()}`)
-  }
-
-  if (parts.length === 0) {
-    return "_Working..._"
-  }
-
-  const joined = parts.join("\n\n")
-  if (joined.length <= MAX_DISCORD_MESSAGE) {
-    return joined
-  }
-
-  return `${joined.slice(0, MAX_DISCORD_MESSAGE - 18)}\n\n_(truncated)_`
+  return "_Thinking..._"
 }
 
 export function chunkText(text: string, size = MAX_DISCORD_MESSAGE) {
@@ -132,4 +124,3 @@ export function buildApprovalButtons(
 
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(buttons)]
 }
-
