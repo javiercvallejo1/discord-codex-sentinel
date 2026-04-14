@@ -250,7 +250,7 @@ export class DiscordCodexSentinelService {
       }
 
       const client = new Client({
-        intents: [GatewayIntentBits.DirectMessages, GatewayIntentBits.MessageContent],
+        intents: [GatewayIntentBits.DirectMessages],
         partials: [Partials.Channel],
       })
       const runtime: RuntimeBot = {

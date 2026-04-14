@@ -7,6 +7,9 @@ STATE_ROOT="${HOME}/.codex/discord-sentinel"
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 PLIST_NAME="com.codex.discord-sentinel"
 PLIST_PATH="${PLIST_DIR}/${PLIST_NAME}.plist"
+BUN_BIN="$(command -v bun)"
+CODEX_BIN="$(command -v codex)"
+PATH_VALUE="$(dirname "${BUN_BIN}"):$(dirname "${CODEX_BIN}"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 if ! command -v bun >/dev/null 2>&1; then
   echo "bun is required"
@@ -29,7 +32,7 @@ cat > "${PLIST_PATH}" <<PLIST
   <string>${PLIST_NAME}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$(command -v bun)</string>
+    <string>${BUN_BIN}</string>
     <string>${REPO_ROOT}/src/index.ts</string>
     <string>daemon</string>
     <string>start</string>
@@ -47,7 +50,9 @@ cat > "${PLIST_PATH}" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>${PATH_VALUE}</string>
+    <key>CODEX_BIN</key>
+    <string>${CODEX_BIN}</string>
   </dict>
 </dict>
 </plist>
@@ -58,4 +63,3 @@ launchctl load "${PLIST_PATH}"
 
 echo "Installed ${PLIST_NAME}"
 echo "Logs: ${STATE_ROOT}/logs"
-
