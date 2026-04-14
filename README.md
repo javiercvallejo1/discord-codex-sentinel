@@ -22,7 +22,7 @@
 
 The intended setup path is to use the bundled Codex plugin as the operator surface. The plugin can guide install, ask for the Discord owner ID, add bots, and point Codex at the daemon commands in this repo.
 
-Install the plugin into your personal Codex marketplace with one command:
+Register the plugin in your personal Codex marketplace with one command:
 
 ```bash
 ./scripts/bootstrap-personal-marketplace.sh
@@ -36,10 +36,10 @@ That bootstrap script follows the Codex personal-marketplace layout from the plu
 
 Then:
 1. Restart Codex.
-2. Open `Plugins`.
+2. Open `Plugins` in the app, or run `codex` then `/plugins` in the CLI.
 3. Choose the `Personal Plugins` marketplace.
-4. Install `discord-codex-assistant`.
-5. Use the plugin's install skill to finish Discord setup.
+4. Open `discord-codex-assistant` and select `Install`.
+5. Start a new thread and use the plugin's install skill to finish Discord setup.
 
 `./scripts/install-local-plugin.sh` remains as a compatibility wrapper and now calls the same bootstrap flow.
 
@@ -81,7 +81,7 @@ State lives in `~/.codex/discord-sentinel/`:
 
 This repo also includes a local Codex plugin marketplace at `.agents/plugins/marketplace.json` and a plugin bundle at `plugins/discord-codex-assistant/`.
 
-That repo marketplace is for development and testing inside the repo. The recommended user-facing install path is the personal marketplace bootstrap above.
+That repo marketplace is for development and testing inside the repo. The recommended user-facing path is: register the plugin in the personal marketplace, then install it from `Plugins` or `/plugins` inside Codex.
 
 ## Launchd
 

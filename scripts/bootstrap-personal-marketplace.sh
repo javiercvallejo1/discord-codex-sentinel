@@ -85,11 +85,12 @@ data["plugins"] = filtered
 marketplace_path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
-echo "Installed ${PLUGIN_NAME} into the standard Codex personal marketplace."
+echo "Registered ${PLUGIN_NAME} in your Codex personal marketplace source."
 echo "Plugin source: ${PLUGIN_TARGET}"
 echo "Marketplace: ${MARKETPLACE_PATH}"
 echo "Next:"
 echo "1. Restart Codex."
-echo "2. Open Plugins."
+echo "2. Open Plugins in the app, or run 'codex' then '/plugins' in the CLI."
 echo "3. Choose the 'Personal Plugins' marketplace."
-echo "4. Install '${PLUGIN_NAME}'."
+echo "4. Open '${PLUGIN_NAME}' and select Install."
+echo "5. Start a new thread and use the plugin's install skill."

@@ -9,7 +9,7 @@ Workflow:
 
 1. If the plugin is not installed yet, direct the user to the documented bootstrap flow:
    - `./scripts/bootstrap-personal-marketplace.sh`
-   - then restart Codex, open `Plugins`, choose `Personal Plugins`, and install `discord-codex-assistant`
+   - then restart Codex, open `Plugins` or run `codex` then `/plugins`, choose `Personal Plugins`, and install `discord-codex-assistant`
 2. Check prerequisites:
    - `which bun`
    - `which codex`
