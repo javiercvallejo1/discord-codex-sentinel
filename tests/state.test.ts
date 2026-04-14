@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { listNamedBots } from "../src/state/store"
+import { botSessionStateSchema } from "../src/state/types"
 import { chunkText, renderWorkingMessage } from "../src/ui/discord/renderer"
 
 describe("state helpers", () => {
@@ -23,5 +24,12 @@ describe("renderer helpers", () => {
   test("renderWorkingMessage prefers natural reply text", () => {
     const rendered = renderWorkingMessage("Do work", "Done")
     expect(rendered).toBe("Done")
+  })
+})
+
+describe("session state schema", () => {
+  test("defaults include last inbound message tracking", () => {
+    const state = botSessionStateSchema.parse({})
+    expect(state.last_inbound_message_id).toBeNull()
   })
 })

@@ -74,6 +74,7 @@ interface RuntimeBot {
   activeTurn: ActiveTurn | null
   promptWaiter: PromptWaiter | null
   dmPollTimer: ReturnType<typeof setInterval> | null
+  inboundInFlightMessageIds: Set<string>
 }
 
 interface PendingApproval {
@@ -142,11 +143,7 @@ export class DiscordCodexSentinelService {
 
     for (const runtime of this.bots.values()) {
       try {
-        if (runtime.dmPollTimer) {
-          clearInterval(runtime.dmPollTimer)
-          runtime.dmPollTimer = null
-        }
-        runtime.client.destroy()
+        this.teardownRuntime(runtime)
       } catch {}
     }
     this.bots.clear()
@@ -220,7 +217,7 @@ export class DiscordCodexSentinelService {
     const { config, entries } = await this.listBotsForCli()
     return {
       config,
-      codexConnected: true,
+      codexConnected: this.codex.isRunning(),
       entries,
     }
   }
@@ -243,11 +240,7 @@ export class DiscordCodexSentinelService {
     for (const [name, runtime] of this.bots) {
       if (!desiredNames.has(name)) {
         await this.logger.info(`disconnecting removed bot ${name}`)
-        if (runtime.dmPollTimer) {
-          clearInterval(runtime.dmPollTimer)
-          runtime.dmPollTimer = null
-        }
-        runtime.client.destroy()
+        this.teardownRuntime(runtime)
         this.bots.delete(name)
       }
     }
@@ -255,7 +248,18 @@ export class DiscordCodexSentinelService {
     for (const [name, config] of Object.entries(registry.bots)) {
       const existing = this.bots.get(name)
       if (existing) {
+        const tokenChanged = existing.config.token !== config.token
         existing.config = config
+        if (tokenChanged) {
+          await this.logger.info(`reconnecting bot ${name} after token change`)
+          this.teardownRuntime(existing)
+          this.bots.delete(name)
+        } else {
+          continue
+        }
+      }
+
+      if (this.bots.has(name)) {
         continue
       }
 
@@ -272,6 +276,7 @@ export class DiscordCodexSentinelService {
         activeTurn: null,
         promptWaiter: null,
         dmPollTimer: null,
+        inboundInFlightMessageIds: new Set(),
       }
 
       this.attachDiscordHandlers(runtime)
@@ -300,11 +305,15 @@ export class DiscordCodexSentinelService {
   private attachDiscordHandlers(runtime: RuntimeBot) {
     runtime.client.on("messageCreate", message => {
       void this.logger.info(`gateway message received for ${runtime.name}: ${message.id}`)
-      void this.handleDiscordMessage(runtime, message)
+      void this.handleDiscordMessage(runtime, message).catch(error => {
+        void this.logger.error(`failed to handle Discord message for ${runtime.name}: ${String(error)}`)
+      })
     })
     runtime.client.on("interactionCreate", interaction => {
       if (interaction.isButton()) {
-        void this.handleButtonInteraction(runtime, interaction)
+        void this.handleButtonInteraction(runtime, interaction).catch(error => {
+          void this.logger.error(`failed to handle button interaction for ${runtime.name}: ${String(error)}`)
+        })
       }
     })
   }
@@ -322,22 +331,30 @@ export class DiscordCodexSentinelService {
     runtime.session.last_discord_channel_id = message.channel.id
     await writeBotSessionState(runtime.name, runtime.session)
 
-    if (runtime.promptWaiter) {
-      const waiter = runtime.promptWaiter
-      runtime.promptWaiter = null
-      waiter.resolve(message.content.trim())
-      await this.markInboundProcessed(runtime, message.id)
+    if (!this.beginInboundProcessing(runtime, message.id)) {
       return
     }
 
-    if (message.content.startsWith("!")) {
-      await this.handleLocalCommand(runtime, message)
-      await this.markInboundProcessed(runtime, message.id)
-      return
-    }
+    try {
+      if (runtime.promptWaiter) {
+        const waiter = runtime.promptWaiter
+        runtime.promptWaiter = null
+        waiter.resolve(message.content.trim())
+        await this.markInboundProcessed(runtime, message.id)
+        return
+      }
 
-    await this.startOrSteerTurn(runtime, message.content.trim())
-    await this.markInboundProcessed(runtime, message.id)
+      if (message.content.startsWith("!")) {
+        await this.handleLocalCommand(runtime, message)
+        await this.markInboundProcessed(runtime, message.id)
+        return
+      }
+
+      await this.startOrSteerTurn(runtime, message.content.trim())
+      await this.markInboundProcessed(runtime, message.id)
+    } finally {
+      runtime.inboundInFlightMessageIds.delete(message.id)
+    }
   }
 
   private async handleLocalCommand(runtime: RuntimeBot, message: Message) {
@@ -466,6 +483,7 @@ export class DiscordCodexSentinelService {
       await this.codex.archiveThread(runtime.session.thread_id)
       this.threadToBot.delete(runtime.session.thread_id)
     }
+    this.clearActiveTurn(runtime)
     runtime.session = {
       thread_id: null,
       active_turn_id: null,
@@ -476,7 +494,6 @@ export class DiscordCodexSentinelService {
       updated_at: new Date().toISOString(),
     }
     runtime.threadLoaded = false
-    runtime.activeTurn = null
     await writeBotSessionState(runtime.name, runtime.session)
   }
 
@@ -549,7 +566,7 @@ export class DiscordCodexSentinelService {
     await this.logger.warn("restarting Codex app-server")
     for (const runtime of this.bots.values()) {
       runtime.threadLoaded = false
-      runtime.activeTurn = null
+      this.clearActiveTurn(runtime)
       runtime.session.active_turn_id = null
       runtime.session.last_status = "errored"
       await writeBotSessionState(runtime.name, runtime.session)
@@ -971,7 +988,9 @@ export class DiscordCodexSentinelService {
 
     for (const message of pending) {
       await this.logger.info(`polled DM message for ${runtime.name}: ${message.id}`)
-      await this.handleDiscordMessage(runtime, message)
+      await this.handleDiscordMessage(runtime, message).catch(error => {
+        void this.logger.error(`failed to process polled DM for ${runtime.name}: ${String(error)}`)
+      })
     }
   }
 
@@ -990,6 +1009,44 @@ export class DiscordCodexSentinelService {
 
     runtime.session.last_inbound_message_id = messageId
     await writeBotSessionState(runtime.name, runtime.session)
+  }
+
+  private beginInboundProcessing(runtime: RuntimeBot, messageId: string) {
+    if (
+      runtime.session.last_inbound_message_id &&
+      !this.isSnowflakeAfter(messageId, runtime.session.last_inbound_message_id)
+    ) {
+      return false
+    }
+
+    if (runtime.inboundInFlightMessageIds.has(messageId)) {
+      return false
+    }
+
+    runtime.inboundInFlightMessageIds.add(messageId)
+    return true
+  }
+
+  private clearActiveTurn(runtime: RuntimeBot) {
+    if (runtime.activeTurn?.flushTimer) {
+      clearTimeout(runtime.activeTurn.flushTimer)
+    }
+    if (runtime.activeTurn?.typingTimer) {
+      clearInterval(runtime.activeTurn.typingTimer)
+    }
+    runtime.activeTurn = null
+  }
+
+  private teardownRuntime(runtime: RuntimeBot) {
+    if (runtime.dmPollTimer) {
+      clearInterval(runtime.dmPollTimer)
+      runtime.dmPollTimer = null
+    }
+    this.clearActiveTurn(runtime)
+    if (runtime.session.thread_id) {
+      this.threadToBot.delete(runtime.session.thread_id)
+    }
+    runtime.client.destroy()
   }
 
   private async buildDeveloperInstructions(botName: string) {

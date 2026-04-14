@@ -105,6 +105,10 @@ export class CodexAppServerClient extends EventEmitter {
     this.child = null
   }
 
+  isRunning() {
+    return this.child !== null
+  }
+
   async modelList() {
     return this.request<ModelListResponse>("model/list", {})
   }
