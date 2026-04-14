@@ -18,6 +18,10 @@
 - [Codex CLI](https://developers.openai.com/codex)
 - Discord bot tokens
 
+## Installation
+
+Technical installation steps are documented in [INSTALL.md](/Users/francisco/Documents/discord-codex-sentinel/INSTALL.md).
+
 ## Easy Setup
 
 The intended setup path is to use the bundled Codex plugin as the operator surface. The plugin can guide install, ask for the Discord owner ID, add bots, and point Codex at the daemon commands in this repo.
