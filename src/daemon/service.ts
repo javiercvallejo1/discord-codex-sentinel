@@ -55,9 +55,11 @@ interface ActiveTurn {
   planText: string
   replyText: string
   lastUserText: string
+  lastActivityAt: number
   workingMessageId: string | null
   flushTimer: ReturnType<typeof setTimeout> | null
   typingTimer: ReturnType<typeof setInterval> | null
+  recovering: boolean
   activityMessages: Map<string, { kind: "command" | "file"; text: string; messageId: string | null }>
 }
 
@@ -93,6 +95,9 @@ Reply concisely.
 Before a risky action, explain the intent clearly so the human can approve from Discord.
 If a tool asks for user input, keep the question short and concrete.
 Attachments and images are not supported in this bridge.`
+
+const TURN_STALL_TIMEOUT_MS = 90_000
+const INTERRUPT_TIMEOUT_MS = 5_000
 
 export class DiscordCodexSentinelService {
   private readonly logger = new Logger("sentinel")
@@ -272,7 +277,7 @@ export class DiscordCodexSentinelService {
         name,
         config,
         client,
-        session: await readBotSessionState(name),
+        session: await this.normalizeRecoveredSession(name, await readBotSessionState(name)),
         threadLoaded: false,
         activeTurn: null,
         promptWaiter: null,
@@ -402,9 +407,16 @@ export class DiscordCodexSentinelService {
     await channel.sendTyping().catch(() => {})
 
     if (runtime.activeTurn && runtime.session.active_turn_id) {
+      if (this.isTurnStale(runtime)) {
+        await this.recoverStalledTurn(runtime, "stale active turn detected before handling a new message", false)
+      }
+    }
+
+    if (runtime.activeTurn && runtime.session.active_turn_id) {
       runtime.activeTurn.lastUserText = runtime.activeTurn.lastUserText
         ? `${runtime.activeTurn.lastUserText.trim()}\n\n${text}`
         : text
+      runtime.activeTurn.lastActivityAt = Date.now()
       await this.codex.steerTurn({
         threadId,
         expectedTurnId: runtime.session.active_turn_id,
@@ -426,9 +438,11 @@ export class DiscordCodexSentinelService {
       planText: "",
       replyText: "",
       lastUserText: text,
+      lastActivityAt: Date.now(),
       workingMessageId: null,
       flushTimer: null,
       typingTimer: this.startTypingLoop(runtime),
+      recovering: false,
       activityMessages: new Map(),
     }
     runtime.session.active_turn_id = response.turn.id
@@ -528,7 +542,14 @@ export class DiscordCodexSentinelService {
         await this.disableApproval((notification.params as { requestId: JsonRpcId }).requestId)
         return
       case "thread/status/changed":
-        await this.logger.info(`thread status changed ${(notification.params as { threadId: string }).threadId}`)
+        {
+          const threadId = (notification.params as { threadId: string }).threadId
+          const runtime = this.findRuntimeByThreadId(threadId)
+          if (runtime?.activeTurn) {
+            runtime.activeTurn.lastActivityAt = Date.now()
+          }
+          await this.logger.info(`thread status changed ${threadId}`)
+        }
         return
       default:
         return
@@ -586,12 +607,16 @@ export class DiscordCodexSentinelService {
         planText: "",
         replyText: "",
         lastUserText: "",
+        lastActivityAt: Date.now(),
         workingMessageId: null,
         flushTimer: null,
         typingTimer: this.startTypingLoop(runtime),
+        recovering: false,
         activityMessages: new Map(),
       }
     }
+    runtime.activeTurn.lastActivityAt = Date.now()
+    runtime.activeTurn.recovering = false
     runtime.session.active_turn_id = turnId
     runtime.session.last_status = "running"
     await writeBotSessionState(runtime.name, runtime.session)
@@ -657,6 +682,7 @@ export class DiscordCodexSentinelService {
     } else {
       runtime.activeTurn.replyText += notification.delta
     }
+    runtime.activeTurn.lastActivityAt = Date.now()
     this.scheduleFlush(runtime)
   }
 
@@ -671,6 +697,7 @@ export class DiscordCodexSentinelService {
     }
     current.text += notification.delta
     runtime.activeTurn.activityMessages.set(notification.itemId, current)
+    runtime.activeTurn.lastActivityAt = Date.now()
     this.scheduleFlush(runtime)
   }
 
@@ -737,6 +764,10 @@ export class DiscordCodexSentinelService {
 
   private async emitProgressHint(runtime: RuntimeBot) {
     if (!runtime.activeTurn) return
+    if (this.isTurnStale(runtime)) {
+      await this.recoverStalledTurn(runtime, `no Codex activity for ${Math.round(TURN_STALL_TIMEOUT_MS / 1000)} seconds`, true)
+      return
+    }
     if (runtime.activeTurn.flushTimer) {
       clearTimeout(runtime.activeTurn.flushTimer)
       runtime.activeTurn.flushTimer = null
@@ -766,6 +797,9 @@ export class DiscordCodexSentinelService {
 
     runtime.session.last_status = "waiting_approval"
     await writeBotSessionState(runtime.name, runtime.session)
+    if (runtime.activeTurn) {
+      runtime.activeTurn.lastActivityAt = Date.now()
+    }
 
     const channel = await this.getDmChannel(runtime)
     const includeSession = true
@@ -874,6 +908,9 @@ export class DiscordCodexSentinelService {
 
     const answers: Record<string, { answers: string[] }> = {}
     for (const question of params.questions) {
+      if (runtime.activeTurn) {
+        runtime.activeTurn.lastActivityAt = Date.now()
+      }
       const answer = await this.askQuestion(runtime, question)
       answers[question.id] = { answers: [answer] }
     }
@@ -1043,6 +1080,54 @@ export class DiscordCodexSentinelService {
     runtime.activeTurn = null
   }
 
+  private isTurnStale(runtime: RuntimeBot) {
+    if (!runtime.activeTurn) return false
+    if (runtime.promptWaiter) return false
+    if (runtime.session.last_status === "waiting_approval") return false
+    return Date.now() - runtime.activeTurn.lastActivityAt >= TURN_STALL_TIMEOUT_MS
+  }
+
+  private async recoverStalledTurn(runtime: RuntimeBot, reason: string, notifyUser: boolean) {
+    const activeTurn = runtime.activeTurn
+    if (!activeTurn || activeTurn.recovering) {
+      return false
+    }
+
+    activeTurn.recovering = true
+    await this.logger.warn(`recovering stalled turn ${activeTurn.turnId} for ${runtime.name}: ${reason}`)
+
+    let restartedCodex = false
+    if (runtime.session.thread_id && runtime.session.active_turn_id) {
+      try {
+        await Promise.race([
+          this.codex.interruptTurn(runtime.session.thread_id, runtime.session.active_turn_id),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("interrupt timeout")), INTERRUPT_TIMEOUT_MS)),
+        ])
+      } catch (error) {
+        await this.logger.warn(`interrupt failed for stalled turn ${activeTurn.turnId}: ${String(error)}`)
+        if (this.codex.isRunning()) {
+          restartedCodex = true
+          await this.codex.stop()
+        }
+      }
+    }
+
+    this.clearActiveTurn(runtime)
+    runtime.threadLoaded = runtime.session.thread_id ? !restartedCodex : false
+    runtime.session.active_turn_id = null
+    runtime.session.last_status = restartedCodex ? "errored" : "idle"
+    await writeBotSessionState(runtime.name, runtime.session)
+
+    if (notifyUser) {
+      const channel = await this.getDmChannel(runtime).catch(() => null)
+      if (channel) {
+        await channel.send("I got stuck on the last turn and reset myself. Send that again.")
+      }
+    }
+
+    return true
+  }
+
   private teardownRuntime(runtime: RuntimeBot) {
     if (runtime.dmPollTimer) {
       clearInterval(runtime.dmPollTimer)
@@ -1070,6 +1155,21 @@ export class DiscordCodexSentinelService {
     } catch {
       return this.codex.isRunning()
     }
+  }
+
+  private async normalizeRecoveredSession(name: string, session: BotSessionState) {
+    if (!session.active_turn_id && session.last_status !== "running" && session.last_status !== "waiting_approval") {
+      return session
+    }
+
+    const normalized: BotSessionState = {
+      ...session,
+      active_turn_id: null,
+      last_status: "idle",
+      updated_at: new Date().toISOString(),
+    }
+    await writeBotSessionState(name, normalized)
+    return normalized
   }
 
   private async buildDeveloperInstructions(botName: string) {
