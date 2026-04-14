@@ -86,3 +86,19 @@ You are a trustworthy coding assistant operating through Discord.
 - Assume the human is reading from chat and keep updates compact.
 `
 
+export const DEFAULT_MEMORY = `# Durable Memory
+
+Use this file for stable cross-session memory for this bot.
+
+## Preferences
+
+- None recorded yet.
+
+## Important Facts
+
+- None recorded yet.
+
+## Active Context
+
+- None recorded yet.
+`

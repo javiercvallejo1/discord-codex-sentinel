@@ -27,8 +27,10 @@ import { LOGS_DIR } from "../state/paths"
 import {
   addBot,
   clearBotSessionState,
+  appendMemoryJournal,
   ensureStateDirs,
   listNamedBots,
+  readMemory,
   readBotSessionState,
   readPersonality,
   readRegistry,
@@ -51,6 +53,7 @@ interface ActiveTurn {
   turnId: string
   planText: string
   replyText: string
+  lastUserText: string
   workingMessageId: string | null
   flushTimer: ReturnType<typeof setTimeout> | null
   activityMessages: Map<string, { kind: "command" | "file"; text: string; messageId: string | null }>
@@ -363,6 +366,9 @@ export class DiscordCodexSentinelService {
     const threadId = await this.ensureThread(runtime)
 
     if (runtime.activeTurn && runtime.session.active_turn_id) {
+      runtime.activeTurn.lastUserText = runtime.activeTurn.lastUserText
+        ? `${runtime.activeTurn.lastUserText.trim()}\n\n${text}`
+        : text
       await this.codex.steerTurn({
         threadId,
         expectedTurnId: runtime.session.active_turn_id,
@@ -383,6 +389,7 @@ export class DiscordCodexSentinelService {
       turnId: response.turn.id,
       planText: "",
       replyText: "",
+      lastUserText: text,
       workingMessageId: runtime.session.last_working_message_id,
       flushTimer: null,
       activityMessages: new Map(),
@@ -402,13 +409,14 @@ export class DiscordCodexSentinelService {
     }
 
     const project = runtime.config.project ?? this.registryConfig?.default_project ?? process.cwd()
+    const developerInstructions = await this.buildDeveloperInstructions(runtime.name)
     const shared = {
       cwd: project,
       model: runtime.config.model ?? this.registryConfig?.default_model ?? null,
       approvalPolicy: runtime.config.approval_policy ?? this.registryConfig?.default_approval_policy ?? "on-request",
       sandbox: runtime.config.sandbox_mode ?? this.registryConfig?.default_sandbox_mode ?? "workspace-write",
       baseInstructions: BASE_INSTRUCTIONS,
-      developerInstructions: await readPersonality(runtime.name),
+      developerInstructions,
       personality: "pragmatic" as const,
     }
 
@@ -542,6 +550,7 @@ export class DiscordCodexSentinelService {
         turnId,
         planText: "",
         replyText: "",
+        lastUserText: "",
         workingMessageId: runtime.session.last_working_message_id,
         flushTimer: null,
         activityMessages: new Map(),
@@ -561,14 +570,21 @@ export class DiscordCodexSentinelService {
     await writeBotSessionState(runtime.name, runtime.session)
 
     if (runtime.activeTurn) {
+      const completedTurn = runtime.activeTurn
       await this.flushWorkingMessage(runtime, true)
-      const fullReply = runtime.activeTurn.replyText.trim()
+      const fullReply = completedTurn.replyText.trim()
       const chunks = chunkText(fullReply)
       if (chunks.length > 1) {
         const channel = await this.getDmChannel(runtime)
         for (const chunk of chunks.slice(1)) {
           await channel.send(chunk)
         }
+      }
+      if (completedTurn.lastUserText.trim() || fullReply) {
+        await appendMemoryJournal(runtime.name, {
+          user: completedTurn.lastUserText,
+          assistant: fullReply,
+        })
       }
       runtime.activeTurn = null
     }
@@ -749,7 +765,6 @@ export class DiscordCodexSentinelService {
       await this.codex.respond(requestId, { decision })
     }
 
-    this.approvals.delete(requestId)
     await this.disableApproval(requestId)
   }
 
@@ -869,5 +884,19 @@ export class DiscordCodexSentinelService {
       text,
       text_elements: [],
     }
+  }
+
+  private async buildDeveloperInstructions(botName: string) {
+    const [personality, memory] = await Promise.all([
+      readPersonality(botName),
+      readMemory(botName),
+    ])
+
+    return [
+      personality.trim(),
+      "## Durable Memory",
+      "Treat the following as stable cross-session context for this Discord bot.",
+      memory.trim(),
+    ].join("\n\n")
   }
 }

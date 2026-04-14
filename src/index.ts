@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process"
 import { chmod } from "node:fs/promises"
 import { join } from "node:path"
 import { DiscordCodexSentinelService } from "./daemon/service"
+import { startMcpServer } from "./mcp/server"
 
 function usage() {
   return [
@@ -14,6 +15,7 @@ function usage() {
     "  bun src/index.ts bot remove <name>",
     "  bun src/index.ts bot list",
     "  bun src/index.ts thread reset <name>",
+    "  bun src/index.ts mcp serve",
   ].join("\n")
 }
 
@@ -114,6 +116,13 @@ async function main() {
         }
         await service.resetThreadForCli(rest[0])
         console.log(`Reset thread for '${rest[0]}'`)
+        return
+      }
+      case "mcp": {
+        if (subcommand !== "serve") {
+          throw new Error("unknown mcp subcommand")
+        }
+        await startMcpServer()
         return
       }
       default:

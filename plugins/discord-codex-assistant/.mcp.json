@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "discord-codex-sentinel": {
+      "command": "bun",
+      "args": ["../../src/index.ts", "mcp", "serve"],
+      "note": "Local MCP server for Discord Codex Sentinel. Run bun install in the repo before using these tools."
+    }
+  }
+}

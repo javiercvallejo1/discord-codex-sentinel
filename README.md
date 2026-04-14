@@ -7,8 +7,9 @@
 - A Bun daemon that supervises `codex app-server`
 - One Discord client per configured bot token
 - Persistent per-bot Codex threads and local runtime state
+- Durable per-bot memory summaries and turn journals
 - Discord approval buttons for command execution and file changes
-- A bundled Codex plugin and local marketplace scaffold for Codex-native skills
+- A bundled Codex plugin plus MCP server for Codex-native install and management flows
 
 ## Requirements
 
@@ -24,6 +25,15 @@ The intended setup path is to use the bundled Codex plugin as the operator surfa
 If you want to install the local plugin marketplace into your Codex home first:
 
 ```bash
+./scripts/install-local-plugin.sh
+```
+
+That installer writes a home-local plugin copy and stamps it with the absolute repo path so the plugin's MCP tools can call this repo directly.
+
+Before using the MCP-backed plugin tools, install repo dependencies once:
+
+```bash
+bun install
 ./scripts/install-local-plugin.sh
 ```
 
@@ -49,6 +59,7 @@ bun run src/index.ts config project /absolute/default/project/path
 bun run src/index.ts thread reset my-bot
 bun run src/index.ts daemon status
 bun run src/index.ts daemon logs
+bun run src/index.ts mcp serve
 ```
 
 ## Runtime State
@@ -57,6 +68,8 @@ State lives in `~/.codex/discord-sentinel/`:
 
 - `bots.json`
 - `personalities/<bot>.md`
+- `memory/<bot>.md`
+- `memory-journal/<bot>.md`
 - `state/<bot>.json`
 - `logs/`
 
@@ -64,7 +77,7 @@ State lives in `~/.codex/discord-sentinel/`:
 
 This repo also includes a local Codex plugin marketplace at `.agents/plugins/marketplace.json` and a plugin bundle at `plugins/discord-codex-assistant/`.
 
-That plugin does not replace the daemon. It packages Codex-side guidance and reusable skills so you can install the same "trusted Discord assistant" behavior into Codex itself when you want the agent to carry that workflow locally.
+That plugin does not replace the daemon. It packages Codex-side guidance, reusable skills, and an MCP bridge so Codex can install and manage the Discord setup with much less manual terminal work.
 
 ## Launchd
 

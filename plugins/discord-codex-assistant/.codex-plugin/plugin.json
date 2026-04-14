@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Guided setup and trusted assistant behaviors for Discord Codex Sentinel.",
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Discord Codex Assistant",
     "shortDescription": "Guided Discord Codex setup and operation",
