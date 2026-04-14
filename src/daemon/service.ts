@@ -1,5 +1,6 @@
 import { watch } from "node:fs"
 import { readFile } from "node:fs/promises"
+import { execFileSync } from "node:child_process"
 import { join } from "node:path"
 import {
   ButtonInteraction,
@@ -217,7 +218,7 @@ export class DiscordCodexSentinelService {
     const { config, entries } = await this.listBotsForCli()
     return {
       config,
-      codexConnected: this.codex.isRunning(),
+      codexConnected: this.isDaemonRunningUnderLaunchd(),
       entries,
     }
   }
@@ -688,12 +689,17 @@ export class DiscordCodexSentinelService {
       runtime.activeTurn.flushTimer = null
     }
 
-    if (!runtime.activeTurn.workingMessageId) {
+    const activeTurn = runtime.activeTurn
+    if (!activeTurn.workingMessageId) {
       return
     }
 
     const working = await this.getOrCreateWorkingMessage(runtime)
-    const content = renderWorkingMessage(runtime.activeTurn.planText, runtime.activeTurn.replyText)
+    if (!runtime.activeTurn || runtime.activeTurn.turnId !== activeTurn.turnId) {
+      return
+    }
+
+    const content = renderWorkingMessage(activeTurn.planText, activeTurn.replyText)
     await working.edit(content)
 
     if (final) {
@@ -1047,6 +1053,23 @@ export class DiscordCodexSentinelService {
       this.threadToBot.delete(runtime.session.thread_id)
     }
     runtime.client.destroy()
+  }
+
+  private isDaemonRunningUnderLaunchd() {
+    try {
+      const uid = typeof process.getuid === "function" ? process.getuid() : null
+      if (uid === null) {
+        return this.codex.isRunning()
+      }
+
+      const output = execFileSync("launchctl", ["print", `gui/${uid}/com.codex.discord-sentinel`], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+      return output.includes("state = running")
+    } catch {
+      return this.codex.isRunning()
+    }
   }
 
   private async buildDeveloperInstructions(botName: string) {
