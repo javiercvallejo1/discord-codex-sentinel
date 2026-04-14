@@ -72,6 +72,7 @@ interface RuntimeBot {
   threadLoaded: boolean
   activeTurn: ActiveTurn | null
   promptWaiter: PromptWaiter | null
+  dmPollTimer: ReturnType<typeof setInterval> | null
 }
 
 interface PendingApproval {
@@ -140,6 +141,10 @@ export class DiscordCodexSentinelService {
 
     for (const runtime of this.bots.values()) {
       try {
+        if (runtime.dmPollTimer) {
+          clearInterval(runtime.dmPollTimer)
+          runtime.dmPollTimer = null
+        }
         runtime.client.destroy()
       } catch {}
     }
@@ -237,6 +242,10 @@ export class DiscordCodexSentinelService {
     for (const [name, runtime] of this.bots) {
       if (!desiredNames.has(name)) {
         await this.logger.info(`disconnecting removed bot ${name}`)
+        if (runtime.dmPollTimer) {
+          clearInterval(runtime.dmPollTimer)
+          runtime.dmPollTimer = null
+        }
         runtime.client.destroy()
         this.bots.delete(name)
       }
@@ -261,10 +270,12 @@ export class DiscordCodexSentinelService {
         threadLoaded: false,
         activeTurn: null,
         promptWaiter: null,
+        dmPollTimer: null,
       }
 
       this.attachDiscordHandlers(runtime)
       await client.login(config.token)
+      this.startDmPolling(runtime)
       this.bots.set(name, runtime)
       if (runtime.session.thread_id) {
         this.threadToBot.set(runtime.session.thread_id, name)
@@ -287,6 +298,7 @@ export class DiscordCodexSentinelService {
 
   private attachDiscordHandlers(runtime: RuntimeBot) {
     runtime.client.on("messageCreate", message => {
+      void this.logger.info(`gateway message received for ${runtime.name}: ${message.id}`)
       void this.handleDiscordMessage(runtime, message)
     })
     runtime.client.on("interactionCreate", interaction => {
@@ -313,15 +325,18 @@ export class DiscordCodexSentinelService {
       const waiter = runtime.promptWaiter
       runtime.promptWaiter = null
       waiter.resolve(message.content.trim())
+      await this.markInboundProcessed(runtime, message.id)
       return
     }
 
     if (message.content.startsWith("!")) {
       await this.handleLocalCommand(runtime, message)
+      await this.markInboundProcessed(runtime, message.id)
       return
     }
 
     await this.startOrSteerTurn(runtime, message.content.trim())
+    await this.markInboundProcessed(runtime, message.id)
   }
 
   private async handleLocalCommand(runtime: RuntimeBot, message: Message) {
@@ -454,6 +469,7 @@ export class DiscordCodexSentinelService {
       thread_id: null,
       active_turn_id: null,
       last_discord_channel_id: runtime.session.last_discord_channel_id,
+      last_inbound_message_id: runtime.session.last_inbound_message_id,
       last_working_message_id: null,
       last_status: "idle",
       updated_at: new Date().toISOString(),
@@ -884,6 +900,68 @@ export class DiscordCodexSentinelService {
       text,
       text_elements: [],
     }
+  }
+
+  private startDmPolling(runtime: RuntimeBot) {
+    if (runtime.dmPollTimer) {
+      clearInterval(runtime.dmPollTimer)
+    }
+
+    runtime.dmPollTimer = setInterval(() => {
+      void this.pollDmChannel(runtime)
+    }, 3000)
+
+    void this.pollDmChannel(runtime)
+  }
+
+  private async pollDmChannel(runtime: RuntimeBot) {
+    const ownerId = this.registryConfig?.owner_id ?? ""
+    if (!ownerId) return
+    if (!runtime.client.isReady()) return
+
+    const channel = await this.getDmChannel(runtime).catch(() => null)
+    if (!channel) return
+
+    if (runtime.session.last_discord_channel_id !== channel.id) {
+      runtime.session.last_discord_channel_id = channel.id
+      await writeBotSessionState(runtime.name, runtime.session)
+    }
+
+    const fetched = await channel.messages.fetch({ limit: 10 }).catch(() => null)
+    if (!fetched) return
+
+    const ownerMessages = [...fetched.values()]
+      .filter(message => !message.author.bot && message.author.id === ownerId)
+      .sort((left, right) => left.createdTimestamp - right.createdTimestamp)
+
+    const pending =
+      runtime.session.last_inbound_message_id === null
+        ? ownerMessages.slice(-1)
+        : ownerMessages.filter(message =>
+            this.isSnowflakeAfter(message.id, runtime.session.last_inbound_message_id),
+          )
+
+    for (const message of pending) {
+      await this.logger.info(`polled DM message for ${runtime.name}: ${message.id}`)
+      await this.handleDiscordMessage(runtime, message)
+    }
+  }
+
+  private isSnowflakeAfter(left: string, right: string | null) {
+    if (!right) return true
+    return BigInt(left) > BigInt(right)
+  }
+
+  private async markInboundProcessed(runtime: RuntimeBot, messageId: string) {
+    if (
+      runtime.session.last_inbound_message_id &&
+      !this.isSnowflakeAfter(messageId, runtime.session.last_inbound_message_id)
+    ) {
+      return
+    }
+
+    runtime.session.last_inbound_message_id = messageId
+    await writeBotSessionState(runtime.name, runtime.session)
   }
 
   private async buildDeveloperInstructions(botName: string) {

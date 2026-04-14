@@ -57,6 +57,7 @@ export const botSessionStateSchema = z.object({
   thread_id: z.string().nullable().default(null),
   active_turn_id: z.string().nullable().default(null),
   last_discord_channel_id: z.string().nullable().default(null),
+  last_inbound_message_id: z.string().nullable().default(null),
   last_working_message_id: z.string().nullable().default(null),
   last_status: sessionStatusSchema.default("idle"),
   updated_at: z.string().default(() => new Date().toISOString()),
