@@ -7,11 +7,12 @@ Use this skill when the user wants to set up Discord Codex Sentinel.
 
 Workflow:
 
-1. Check prerequisites:
+1. If the plugin is not installed yet, direct the user to the documented bootstrap flow:
+   - `./scripts/bootstrap-personal-marketplace.sh`
+   - then restart Codex, open `Plugins`, choose `Personal Plugins`, and install `discord-codex-assistant`
+2. Check prerequisites:
    - `which bun`
    - `which codex`
-2. Install project dependencies:
-   - `bun install`
 3. If the plugin MCP tools are available, prefer them for setup:
    - `discord_sentinel_install_state`
    - `discord_sentinel_set_owner`

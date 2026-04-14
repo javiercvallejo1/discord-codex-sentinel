@@ -22,22 +22,26 @@
 
 The intended setup path is to use the bundled Codex plugin as the operator surface. The plugin can guide install, ask for the Discord owner ID, add bots, and point Codex at the daemon commands in this repo.
 
-If you want to install the local plugin marketplace into your Codex home first:
+Install the plugin into your personal Codex marketplace with one command:
 
 ```bash
-./scripts/install-local-plugin.sh
+./scripts/bootstrap-personal-marketplace.sh
 ```
 
-That installer writes a home-local plugin copy and stamps it with the absolute repo path so the plugin's MCP tools can call this repo directly.
+That bootstrap script follows the Codex personal-marketplace layout from the plugin docs:
+- installs the plugin into `~/.codex/plugins/discord-codex-assistant`
+- writes or updates `~/.agents/plugins/marketplace.json`
+- runs `bun install`
+- stamps the plugin copy with this repo path so its MCP server can call back into the repo
 
-Before using the MCP-backed plugin tools, install repo dependencies once:
+Then:
+1. Restart Codex.
+2. Open `Plugins`.
+3. Choose the `Personal Plugins` marketplace.
+4. Install `discord-codex-assistant`.
+5. Use the plugin's install skill to finish Discord setup.
 
-```bash
-bun install
-./scripts/install-local-plugin.sh
-```
-
-Then, inside Codex, install the local `discord-codex-assistant` plugin and use its install skill to guide setup.
+`./scripts/install-local-plugin.sh` remains as a compatibility wrapper and now calls the same bootstrap flow.
 
 ## Quick Start
 
@@ -77,7 +81,7 @@ State lives in `~/.codex/discord-sentinel/`:
 
 This repo also includes a local Codex plugin marketplace at `.agents/plugins/marketplace.json` and a plugin bundle at `plugins/discord-codex-assistant/`.
 
-That plugin does not replace the daemon. It packages Codex-side guidance, reusable skills, and an MCP bridge so Codex can install and manage the Discord setup with much less manual terminal work.
+That repo marketplace is for development and testing inside the repo. The recommended user-facing install path is the personal marketplace bootstrap above.
 
 ## Launchd
 
