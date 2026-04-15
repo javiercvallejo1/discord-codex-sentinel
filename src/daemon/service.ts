@@ -42,6 +42,7 @@ import {
 } from "../state/store"
 import type { BotConfig, BotSessionState, RegistryConfig } from "../state/types"
 import {
+  type ApprovalDecision,
   buildApprovalButtons,
   chunkText,
   renderApprovalText,
@@ -85,8 +86,10 @@ interface PendingApproval {
   botName: string
   channelId: string
   discordMessageId: string
-  includeSession: boolean
+  approvalId: string | null
+  availableDecisions: ApprovalDecision[]
   legacy: boolean
+  timeout: ReturnType<typeof setTimeout> | null
 }
 
 const BASE_INSTRUCTIONS = `You are operating through a Discord bridge.
@@ -799,7 +802,9 @@ export class DiscordCodexSentinelService {
       ? this.findRuntimeByThreadId("conversationId" in params ? params.conversationId : "")
       : this.findRuntimeByThreadId("threadId" in params ? params.threadId : "")
     if (!runtime) {
-      await this.codex.respond(requestId, legacy ? { decision: "abort" } : { decision: "cancel" })
+      await this.respondToApproval(requestId, "cancel", legacy, "approval target not found", {
+        approvalId: "approvalId" in params ? params.approvalId ?? null : null,
+      })
       return
     }
 
@@ -810,19 +815,25 @@ export class DiscordCodexSentinelService {
     }
 
     const channel = await this.getDmChannel(runtime)
-    const includeSession = true
+    const availableDecisions = this.getAvailableApprovalDecisions(params, legacy)
     const prompt = this.renderApprovalPrompt(params)
     const message = await channel.send({
       content: prompt,
-      components: buildApprovalButtons(String(requestId), includeSession),
+      components: buildApprovalButtons(String(requestId), availableDecisions),
     })
+    const timeoutMs = (this.registryConfig?.approval_timeout_sec ?? 120) * 1000
+    const timeout = setTimeout(() => {
+      void this.expireApproval(String(requestId))
+    }, timeoutMs)
     this.approvals.set(String(requestId), {
       requestId: String(requestId),
       botName: runtime.name,
       channelId: channel.id,
       discordMessageId: message.id,
-      includeSession,
+      approvalId: "approvalId" in params ? params.approvalId ?? null : null,
+      availableDecisions,
       legacy,
+      timeout,
     })
   }
 
@@ -867,14 +878,23 @@ export class DiscordCodexSentinelService {
       return
     }
 
-    await interaction.deferUpdate()
-    if (pending.legacy) {
-      await this.codex.respond(requestId, { decision: this.mapLegacyDecision(decision) })
-    } else {
-      await this.codex.respond(requestId, { decision })
+    if (!pending.availableDecisions.includes(decision as ApprovalDecision)) {
+      await interaction.reply({ content: "That approval option is not available.", ephemeral: true })
+      return
     }
 
-    await this.disableApproval(requestId)
+    await interaction.deferUpdate()
+    try {
+      await this.respondToApproval(requestId, decision as ApprovalDecision, pending.legacy, "discord button", {
+        approvalId: pending.approvalId,
+      })
+      await this.disableApproval(requestId)
+    } catch (error) {
+      await interaction.followUp({
+        content: `Approval failed: ${String(error)}`,
+        ephemeral: true,
+      }).catch(() => null)
+    }
   }
 
   private mapLegacyDecision(decision: string) {
@@ -890,10 +910,87 @@ export class DiscordCodexSentinelService {
     }
   }
 
-  private async disableApproval(requestId: JsonRpcId) {
+  private getAvailableApprovalDecisions(
+    params:
+      | CommandExecutionApprovalRequest
+      | FileChangeApprovalRequest
+      | LegacyExecApprovalRequest
+      | LegacyPatchApprovalRequest,
+    legacy: boolean,
+  ): ApprovalDecision[] {
+    if (legacy) {
+      return ["accept", "acceptForSession", "decline", "cancel"]
+    }
+
+    if ("availableDecisions" in params && Array.isArray(params.availableDecisions) && params.availableDecisions.length > 0) {
+      const supported = params.availableDecisions.filter((decision): decision is ApprovalDecision =>
+        decision === "accept" ||
+        decision === "acceptForSession" ||
+        decision === "decline" ||
+        decision === "cancel",
+      )
+      if (supported.length > 0) {
+        return supported
+      }
+    }
+
+    if ("command" in params || "cwd" in params) {
+      return ["accept", "acceptForSession", "decline", "cancel"]
+    }
+
+    return ["accept", "decline", "cancel"]
+  }
+
+  private async respondToApproval(
+    requestId: JsonRpcId,
+    decision: ApprovalDecision,
+    legacy: boolean,
+    reason: string,
+    params: { approvalId?: string | null },
+  ) {
+    await this.logger.info(`resolving approval ${String(requestId)} as ${decision} (${reason})`)
+    if (legacy) {
+      await this.codex.respond(requestId, {
+        decision: this.mapLegacyDecision(decision),
+        ...(params.approvalId ? { approvalId: params.approvalId } : {}),
+      })
+      return
+    }
+
+    await this.codex.respond(requestId, {
+      decision,
+      ...(params.approvalId ? { approvalId: params.approvalId } : {}),
+    })
+  }
+
+  private async expireApproval(requestId: string) {
+    const pending = this.approvals.get(requestId)
+    if (!pending) return
+
+    const runtime = this.bots.get(pending.botName)
+    if (!runtime) {
+      await this.disableApproval(requestId, "_Timed out._")
+      return
+    }
+
+    try {
+      await this.respondToApproval(requestId, "cancel", pending.legacy, "approval timeout", {
+        approvalId: pending.approvalId,
+      })
+    } catch (error) {
+      await this.logger.error(`failed to cancel timed-out approval ${requestId}: ${String(error)}`)
+    }
+
+    await this.disableApproval(requestId, "_Timed out._")
+  }
+
+  private async disableApproval(requestId: JsonRpcId, suffix = "_Resolved._") {
     const pending = this.approvals.get(String(requestId))
     if (!pending) return
     this.approvals.delete(String(requestId))
+    if (pending.timeout) {
+      clearTimeout(pending.timeout)
+    }
 
     const runtime = this.bots.get(pending.botName)
     if (!runtime) return
@@ -902,7 +999,7 @@ export class DiscordCodexSentinelService {
     const message = await channel.messages.fetch(pending.discordMessageId).catch(() => null)
     if (!message) return
 
-    await message.edit({ content: `${message.content}\n\n_Resolved._`, components: [] })
+    await message.edit({ content: `${message.content}\n\n${suffix}`, components: [] })
     runtime.session.last_status = runtime.session.active_turn_id ? "running" : "idle"
     await writeBotSessionState(runtime.name, runtime.session)
   }

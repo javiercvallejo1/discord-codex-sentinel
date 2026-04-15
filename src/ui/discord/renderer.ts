@@ -5,6 +5,7 @@ import {
 } from "discord.js"
 
 export const MAX_DISCORD_MESSAGE = 1900
+export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel"
 
 export function renderWorkingMessage(plan: string, reply: string) {
   if (reply.trim()) {
@@ -86,18 +87,22 @@ export function renderApprovalText(input: {
 
 export function buildApprovalButtons(
   requestId: string,
-  includeSession = true,
+  availableDecisions: ApprovalDecision[] = ["accept", "acceptForSession", "decline", "cancel"],
   disabled = false,
 ) {
-  const buttons = [
-    new ButtonBuilder()
-      .setCustomId(`approval:${requestId}:accept`)
-      .setLabel("Accept")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(disabled),
-  ]
+  const buttons: ButtonBuilder[] = []
 
-  if (includeSession) {
+  if (availableDecisions.includes("accept")) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`approval:${requestId}:accept`)
+        .setLabel("Accept")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(disabled),
+    )
+  }
+
+  if (availableDecisions.includes("acceptForSession")) {
     buttons.push(
       new ButtonBuilder()
         .setCustomId(`approval:${requestId}:acceptForSession`)
@@ -107,20 +112,24 @@ export function buildApprovalButtons(
     )
   }
 
-  buttons.push(
-    new ButtonBuilder()
-      .setCustomId(`approval:${requestId}:decline`)
-      .setLabel("Decline")
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(disabled),
-  )
-  buttons.push(
-    new ButtonBuilder()
-      .setCustomId(`approval:${requestId}:cancel`)
-      .setLabel("Cancel")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(disabled),
-  )
+  if (availableDecisions.includes("decline")) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`approval:${requestId}:decline`)
+        .setLabel("Decline")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(disabled),
+    )
+  }
+  if (availableDecisions.includes("cancel")) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`approval:${requestId}:cancel`)
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled),
+    )
+  }
 
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(buttons)]
 }
