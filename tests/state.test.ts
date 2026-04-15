@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { listNamedBots } from "../src/state/store"
 import { botSessionStateSchema } from "../src/state/types"
-import { chunkText, renderWorkingMessage } from "../src/ui/discord/renderer"
+import { chunkText, MAX_DISCORD_MESSAGE, renderWorkingMessage } from "../src/ui/discord/renderer"
 
 describe("state helpers", () => {
   test("listNamedBots sorts by name", () => {
@@ -16,9 +16,9 @@ describe("state helpers", () => {
 
 describe("renderer helpers", () => {
   test("chunkText splits long content", () => {
-    const chunks = chunkText("a".repeat(8000), 3500)
+    const chunks = chunkText("a".repeat(MAX_DISCORD_MESSAGE * 3))
     expect(chunks.length).toBeGreaterThan(1)
-    expect(chunks.every(chunk => chunk.length <= 3500)).toBe(true)
+    expect(chunks.every(chunk => chunk.length <= MAX_DISCORD_MESSAGE)).toBe(true)
   })
 
   test("renderWorkingMessage prefers natural reply text", () => {

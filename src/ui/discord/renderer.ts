@@ -4,7 +4,7 @@ import {
   ButtonStyle,
 } from "discord.js"
 
-const MAX_DISCORD_MESSAGE = 3500
+export const MAX_DISCORD_MESSAGE = 1900
 
 export function renderWorkingMessage(plan: string, reply: string) {
   if (reply.trim()) {

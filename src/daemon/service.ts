@@ -120,13 +120,19 @@ export class DiscordCodexSentinelService {
     this.registryConfig = registry.config
 
     this.codex.on("notification", notification => {
-      void this.handleNotification(notification)
+      void this.handleNotification(notification).catch(error => {
+        void this.logger.error(`failed to handle Codex notification: ${String(error)}`)
+      })
     })
     this.codex.on("serverRequest", request => {
-      void this.handleServerRequest(request)
+      void this.handleServerRequest(request).catch(error => {
+        void this.logger.error(`failed to handle Codex server request: ${String(error)}`)
+      })
     })
     this.codex.on("exit", () => {
-      void this.handleCodexExit()
+      void this.handleCodexExit().catch(error => {
+        void this.logger.error(`failed to recover from Codex app-server exit: ${String(error)}`)
+      })
     })
 
     await this.codex.start()
@@ -669,7 +675,9 @@ export class DiscordCodexSentinelService {
 
     if (turn.status === "failed") {
       const channel = await this.getDmChannel(runtime)
-      await channel.send(`Turn failed${turn.error?.message ? `: ${turn.error.message}` : "."}`)
+      for (const chunk of chunkText(`Turn failed${turn.error?.message ? `: ${turn.error.message}` : "."}`)) {
+        await channel.send(chunk)
+      }
     }
   }
 
