@@ -7,12 +7,48 @@ import {
 export const MAX_DISCORD_MESSAGE = 1900
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel"
 
+function truncateForDiscord(text: string, size = MAX_DISCORD_MESSAGE) {
+  const trimmed = text.trim()
+  if (trimmed.length <= size) {
+    return trimmed
+  }
+
+  const suffix = "\n\n_(truncated)_"
+  const budget = Math.max(0, size - suffix.length)
+  return `${trimmed.slice(0, budget).trimEnd()}${suffix}`
+}
+
+export function fitDiscordMessage(text: string, size = MAX_DISCORD_MESSAGE) {
+  return truncateForDiscord(text, size)
+}
+
+export function appendDiscordSuffix(
+  text: string,
+  suffix: string,
+  size = MAX_DISCORD_MESSAGE,
+) {
+  const normalizedBase = text.trim()
+  const normalizedSuffix = suffix.trim()
+  const combined = normalizedBase
+    ? `${normalizedBase}\n\n${normalizedSuffix}`
+    : normalizedSuffix
+
+  if (combined.length <= size) {
+    return combined
+  }
+
+  if (normalizedSuffix.length >= size) {
+    return truncateForDiscord(normalizedSuffix, size)
+  }
+
+  const available = size - normalizedSuffix.length - 2
+  const base = truncateForDiscord(normalizedBase, available)
+  return `${base}\n\n${normalizedSuffix}`
+}
+
 export function renderWorkingMessage(plan: string, reply: string) {
   if (reply.trim()) {
-    if (reply.length <= MAX_DISCORD_MESSAGE) {
-      return reply.trim()
-    }
-    return `${reply.trim().slice(0, MAX_DISCORD_MESSAGE - 18)}\n\n_(truncated)_`
+    return fitDiscordMessage(reply)
   }
 
   if (plan.trim()) {
@@ -54,20 +90,20 @@ export function renderStatusMessage(input: {
   status: string
   project: string
 }) {
-  return [
+  return fitDiscordMessage([
     `**${input.label}** (\`${input.botName}\`)`,
     `Status: \`${input.status}\``,
     `Project: \`${input.project}\``,
     `Thread: ${input.threadId ? `\`${input.threadId}\`` : "_none_"}`,
     `Active turn: ${input.turnId ? `\`${input.turnId}\`` : "_none_"}`,
-  ].join("\n")
+  ].join("\n"))
 }
 
 export function renderQuestionPrompt(header: string, question: string, options: string[]) {
   const optionBlock = options.length
     ? `\n\nOptions:\n${options.map((option, index) => `${index + 1}. ${option}`).join("\n")}`
     : ""
-  return `**${header}**\n${question}${optionBlock}`
+  return fitDiscordMessage(`**${header}**\n${question}${optionBlock}`)
 }
 
 export function renderApprovalText(input: {
@@ -82,7 +118,7 @@ export function renderApprovalText(input: {
   if (input.command) lines.push(`Command:\n\`\`\`\n${input.command.slice(0, 1200)}\n\`\`\``)
   if (input.cwd) lines.push(`Cwd: \`${input.cwd}\``)
   if (input.grantRoot) lines.push(`Grant root: \`${input.grantRoot}\``)
-  return lines.join("\n")
+  return fitDiscordMessage(lines.join("\n"))
 }
 
 export function buildApprovalButtons(

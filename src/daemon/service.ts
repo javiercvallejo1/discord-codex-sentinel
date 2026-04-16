@@ -42,9 +42,11 @@ import {
 } from "../state/store"
 import type { BotConfig, BotSessionState, RegistryConfig } from "../state/types"
 import {
+  appendDiscordSuffix,
   type ApprovalDecision,
   buildApprovalButtons,
   chunkText,
+  fitDiscordMessage,
   renderApprovalText,
   renderQuestionPrompt,
   renderStatusMessage,
@@ -339,7 +341,7 @@ export class DiscordCodexSentinelService {
 
     const ownerId = this.registryConfig?.owner_id ?? ""
     if (ownerId && message.author.id !== ownerId) {
-      await message.reply("This bot only accepts commands from the configured owner.")
+      await message.reply(fitDiscordMessage("This bot only accepts commands from the configured owner."))
       return
     }
 
@@ -377,7 +379,7 @@ export class DiscordCodexSentinelService {
 
     switch (command) {
       case "!help":
-        await message.reply("Commands: `!help`, `!status`, `!stop`, `!reset`")
+        await message.reply(fitDiscordMessage("Commands: `!help`, `!status`, `!stop`, `!reset`"))
         return
       case "!status":
         await message.reply(
@@ -393,18 +395,18 @@ export class DiscordCodexSentinelService {
         return
       case "!stop":
         if (!runtime.session.thread_id || !runtime.session.active_turn_id) {
-          await message.reply("No active turn.")
+          await message.reply(fitDiscordMessage("No active turn."))
           return
         }
         await this.codex.interruptTurn(runtime.session.thread_id, runtime.session.active_turn_id)
-        await message.reply("Interrupt sent.")
+        await message.reply(fitDiscordMessage("Interrupt sent."))
         return
       case "!reset":
         await this.resetBotThread(runtime)
-        await message.reply("Thread archived. The next message will start a fresh Codex thread.")
+        await message.reply(fitDiscordMessage("Thread archived. The next message will start a fresh Codex thread."))
         return
       default:
-        await message.reply("Unknown command.")
+        await message.reply(fitDiscordMessage("Unknown command."))
     }
   }
 
@@ -587,7 +589,7 @@ export class DiscordCodexSentinelService {
         const runtime = this.findRuntimeByUnknownRequest(request.params as any)
         if (runtime) {
           const channel = await this.getDmChannel(runtime)
-          await channel.send(`Codex requested an unsupported capability: \`${request.method}\``)
+          await channel.send(fitDiscordMessage(`Codex requested an unsupported capability: \`${request.method}\``))
         }
     }
   }
@@ -738,7 +740,7 @@ export class DiscordCodexSentinelService {
     }
 
     const content = renderWorkingMessage(activeTurn.planText, activeTurn.replyText)
-    await working.edit(content)
+    await working.edit(fitDiscordMessage(content))
 
     if (final) {
       runtime.session.last_working_message_id = working.id
@@ -869,17 +871,17 @@ export class DiscordCodexSentinelService {
 
     const pending = this.approvals.get(requestId)
     if (!pending) {
-      await interaction.reply({ content: "This approval is no longer pending.", ephemeral: true })
+      await interaction.reply({ content: fitDiscordMessage("This approval is no longer pending."), ephemeral: true })
       return
     }
 
     if (pending.botName !== runtime.name) {
-      await interaction.reply({ content: "Approval belongs to a different bot.", ephemeral: true })
+      await interaction.reply({ content: fitDiscordMessage("Approval belongs to a different bot."), ephemeral: true })
       return
     }
 
     if (!pending.availableDecisions.includes(decision as ApprovalDecision)) {
-      await interaction.reply({ content: "That approval option is not available.", ephemeral: true })
+      await interaction.reply({ content: fitDiscordMessage("That approval option is not available."), ephemeral: true })
       return
     }
 
@@ -891,7 +893,7 @@ export class DiscordCodexSentinelService {
       await this.disableApproval(requestId)
     } catch (error) {
       await interaction.followUp({
-        content: `Approval failed: ${String(error)}`,
+        content: fitDiscordMessage(`Approval failed: ${String(error)}`),
         ephemeral: true,
       }).catch(() => null)
     }
@@ -999,7 +1001,7 @@ export class DiscordCodexSentinelService {
     const message = await channel.messages.fetch(pending.discordMessageId).catch(() => null)
     if (!message) return
 
-    await message.edit({ content: `${message.content}\n\n${suffix}`, components: [] })
+    await message.edit({ content: appendDiscordSuffix(message.content, suffix), components: [] })
     runtime.session.last_status = runtime.session.active_turn_id ? "running" : "idle"
     await writeBotSessionState(runtime.name, runtime.session)
   }
@@ -1226,7 +1228,7 @@ export class DiscordCodexSentinelService {
     if (notifyUser) {
       const channel = await this.getDmChannel(runtime).catch(() => null)
       if (channel) {
-        await channel.send("I got stuck on the last turn and reset myself. Send that again.")
+        await channel.send(fitDiscordMessage("I got stuck on the last turn and reset myself. Send that again."))
       }
     }
 
