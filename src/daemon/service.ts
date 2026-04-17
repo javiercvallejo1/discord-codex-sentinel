@@ -487,11 +487,11 @@ export class DiscordCodexSentinelService {
   }
 
   private async handleLocalCommand(runtime: RuntimeBot, message: Message) {
-    const [command] = message.content.trim().split(/\s+/)
+    const [command, ...rest] = message.content.trim().split(/\s+/)
 
     switch (command) {
       case "!help":
-        await message.reply(fitDiscordMessage("Commands: `!help`, `!status`, `!stop`, `!reset`"))
+        await message.reply(fitDiscordMessage("Commands: `!help`, `!status`, `!btw <note>`, `!stop`, `!reset`"))
         return
       case "!status": {
         const queue = await readJobQueue(runtime.name)
@@ -519,6 +519,53 @@ export class DiscordCodexSentinelService {
           await this.codex.interruptTurn(runtime.session.thread_id, runtime.session.active_turn_id).catch(() => null)
         }
         await message.reply(fitDiscordMessage("Stop sent."))
+        return
+      }
+      case "!btw": {
+        const note = rest.join(" ").trim()
+        if (!note) {
+          await message.reply(fitDiscordMessage("Usage: `!btw <note>`"))
+          return
+        }
+
+        if (!runtime.currentJob || !runtime.session.active_job_id || !runtime.session.thread_id || !runtime.session.active_turn_id) {
+          await message.reply(fitDiscordMessage("No active running job to steer."))
+          return
+        }
+
+        const job = await readJob(runtime.session.active_job_id)
+        if (job.status === "waiting_approval") {
+          await message.reply(fitDiscordMessage("The active job is waiting on approval. Resolve that first."))
+          return
+        }
+        if (job.status === "waiting_input") {
+          await message.reply(fitDiscordMessage("The active job is waiting for an answer. Reply directly to that question first."))
+          return
+        }
+        if (job.status !== "running") {
+          await message.reply(fitDiscordMessage("The active job is no longer steerable."))
+          return
+        }
+
+        await this.codex.steerTurn({
+          threadId: runtime.session.thread_id,
+          expectedTurnId: runtime.session.active_turn_id,
+          input: [this.textInput(note)],
+        })
+
+        await writeJob({
+          ...job,
+          steer_events: [
+            ...job.steer_events,
+            {
+              message_id: message.id,
+              text: note,
+              created_at: new Date().toISOString(),
+            },
+          ],
+        })
+        await this.logger.info(`steered active job ${job.id} for ${runtime.name}`)
+        await message.reply(fitDiscordMessage(`Added to job \`${job.id}\`: ${note}`))
         return
       }
       case "!reset": {
@@ -912,7 +959,7 @@ export class DiscordCodexSentinelService {
       await this.sendJobCompletion(runtime, finalJob)
       if (finalJob.input_text.trim() || fullReply) {
         await appendMemoryJournal(runtime.name, {
-          user: finalJob.input_text,
+          user: this.renderJobUserText(finalJob),
           assistant: fullReply,
         })
       }
@@ -1498,6 +1545,12 @@ export class DiscordCodexSentinelService {
       return fitDiscordMessage(error, 400)
     }
     return fitDiscordMessage(`Job ${status}.`, 400)
+  }
+
+  private renderJobUserText(job: JobRecord) {
+    const steerNotes = job.steer_events.map(event => `BTW: ${event.text.trim()}`).filter(Boolean)
+    const parts = [job.input_text.trim(), ...steerNotes].filter(Boolean)
+    return parts.join("\n\n")
   }
 
   private teardownRuntime(runtime: RuntimeBot) {

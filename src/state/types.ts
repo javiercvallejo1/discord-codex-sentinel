@@ -106,6 +106,11 @@ export const jobRecordSchema = z.object({
   final_reply: z.string().nullable().default(null),
   error: z.string().nullable().default(null),
   cancel_requested: z.boolean().default(false),
+  steer_events: z.array(z.object({
+    message_id: z.string(),
+    text: z.string(),
+    created_at: z.string(),
+  })).default([]),
   artifacts: jobArtifactSchema.default({}),
 })
 
