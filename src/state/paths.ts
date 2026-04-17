@@ -7,6 +7,8 @@ export const PERSONALITIES_DIR = join(STATE_ROOT, "personalities")
 export const SESSION_STATE_DIR = join(STATE_ROOT, "state")
 export const MEMORY_DIR = join(STATE_ROOT, "memory")
 export const MEMORY_JOURNAL_DIR = join(STATE_ROOT, "memory-journal")
+export const JOBS_DIR = join(STATE_ROOT, "jobs")
+export const QUEUES_DIR = join(STATE_ROOT, "queues")
 export const LOGS_DIR = join(STATE_ROOT, "logs")
 
 export function getPersonalityPath(botName: string) {
@@ -23,4 +25,12 @@ export function getMemoryPath(botName: string) {
 
 export function getMemoryJournalPath(botName: string) {
   return join(MEMORY_JOURNAL_DIR, `${botName}.md`)
+}
+
+export function getJobPath(jobId: string) {
+  return join(JOBS_DIR, `${jobId}.json`)
+}
+
+export function getQueuePath(botName: string) {
+  return join(QUEUES_DIR, `${botName}.json`)
 }

@@ -48,5 +48,6 @@ describe("session state schema", () => {
   test("defaults include last inbound message tracking", () => {
     const state = botSessionStateSchema.parse({})
     expect(state.last_inbound_message_id).toBeNull()
+    expect(state.active_job_id).toBeNull()
   })
 })

@@ -27,10 +27,15 @@ import { Logger } from "../state/logger"
 import { LOGS_DIR } from "../state/paths"
 import {
   addBot,
-  clearBotSessionState,
   appendMemoryJournal,
+  clearBotSessionState,
+  createJob,
+  deleteJob,
   ensureStateDirs,
+  listJobs,
   listNamedBots,
+  readJob,
+  readJobQueue,
   readMemory,
   readBotSessionState,
   readPersonality,
@@ -38,9 +43,16 @@ import {
   removeBot,
   resolveProjectPath,
   updateRegistryConfig,
+  writeJob,
+  writeJobQueue,
   writeBotSessionState,
 } from "../state/store"
-import type { BotConfig, BotSessionState, RegistryConfig } from "../state/types"
+import type {
+  BotConfig,
+  BotSessionState,
+  JobRecord,
+  RegistryConfig,
+} from "../state/types"
 import {
   appendDiscordSuffix,
   type ApprovalDecision,
@@ -49,26 +61,20 @@ import {
   fitDiscordMessage,
   renderApprovalText,
   renderQuestionPrompt,
-  renderStatusMessage,
-  renderWorkingMessage,
 } from "../ui/discord/renderer"
 
-interface ActiveTurn {
-  turnId: string
-  planText: string
-  replyText: string
-  lastUserText: string
-  lastActivityAt: number
-  workingMessageId: string | null
-  flushTimer: ReturnType<typeof setTimeout> | null
-  typingTimer: ReturnType<typeof setInterval> | null
-  recovering: boolean
-  activityMessages: Map<string, { kind: "command" | "file"; text: string; messageId: string | null }>
-}
-
 interface PromptWaiter {
+  jobId: string
   header: string
   resolve: (value: string) => void
+}
+
+interface CurrentJobRuntime {
+  jobId: string
+  turnId: string | null
+  replyText: string
+  typingTimer: ReturnType<typeof setInterval> | null
+  cancelIssued: boolean
 }
 
 interface RuntimeBot {
@@ -77,15 +83,17 @@ interface RuntimeBot {
   client: Client
   session: BotSessionState
   threadLoaded: boolean
-  activeTurn: ActiveTurn | null
+  currentJob: CurrentJobRuntime | null
   promptWaiter: PromptWaiter | null
   dmPollTimer: ReturnType<typeof setInterval> | null
+  workerLoop: Promise<void> | null
   inboundInFlightMessageIds: Set<string>
 }
 
 interface PendingApproval {
   requestId: string
   botName: string
+  jobId: string
   channelId: string
   discordMessageId: string
   approvalId: string | null
@@ -100,9 +108,6 @@ Reply concisely.
 Before a risky action, explain the intent clearly so the human can approve from Discord.
 If a tool asks for user input, keep the question short and concrete.
 Attachments and images are not supported in this bridge.`
-
-const TURN_STALL_TIMEOUT_MS = 90_000
-const INTERRUPT_TIMEOUT_MS = 5_000
 
 export class DiscordCodexSentinelService {
   private readonly logger = new Logger("sentinel")
@@ -194,16 +199,27 @@ export class DiscordCodexSentinelService {
   }
 
   async removeBotFromCli(name: string) {
+    const jobs = await listJobs(name)
+    for (const job of jobs) {
+      await deleteJob(job.id).catch(() => null)
+    }
     await removeBot(name)
   }
 
   async listBotsForCli() {
     const registry = await readRegistry()
     const entries = await Promise.all(
-      listNamedBots(registry.bots).map(async bot => ({
-        ...bot,
-        session: await readBotSessionState(bot.name),
-      })),
+      listNamedBots(registry.bots).map(async bot => {
+        const [session, queue] = await Promise.all([
+          readBotSessionState(bot.name),
+          readJobQueue(bot.name),
+        ])
+        return {
+          ...bot,
+          session,
+          queue_depth: queue.pending_job_ids.length,
+        }
+      }),
     )
     return {
       config: registry.config,
@@ -212,6 +228,11 @@ export class DiscordCodexSentinelService {
   }
 
   async resetThreadForCli(name: string) {
+    const queue = await readJobQueue(name)
+    if (queue.active_job_id || queue.pending_job_ids.length > 0) {
+      throw new Error(`Cannot reset '${name}' while it has active or queued jobs`)
+    }
+
     const runtime = this.bots.get(name)
     if (runtime?.session.thread_id) {
       await this.codex.archiveThread(runtime.session.thread_id)
@@ -226,7 +247,93 @@ export class DiscordCodexSentinelService {
     if (runtime) {
       runtime.session = await readBotSessionState(name)
       runtime.threadLoaded = false
-      runtime.activeTurn = null
+      runtime.currentJob = null
+      runtime.promptWaiter = null
+    }
+  }
+
+  async listJobsForCli(botName?: string) {
+    return listJobs(botName)
+  }
+
+  async showJobForCli(jobId: string) {
+    return readJob(jobId)
+  }
+
+  async cancelJobForCli(jobId: string) {
+    const job = await readJob(jobId)
+    const queue = await readJobQueue(job.bot_name)
+
+    if (queue.active_job_id === jobId) {
+      const next = await writeJob({
+        ...job,
+        cancel_requested: true,
+      })
+      return {
+        message: `Cancellation requested for '${jobId}'`,
+        job: next,
+      }
+    }
+
+    if (queue.pending_job_ids.includes(jobId)) {
+      queue.pending_job_ids = queue.pending_job_ids.filter(id => id !== jobId)
+      await writeJobQueue(queue)
+      const next = await writeJob({
+        ...job,
+        status: "cancelled",
+        finished_at: new Date().toISOString(),
+        error: "Cancelled before execution",
+        waiting_kind: null,
+        approval_request_id: null,
+      })
+      return {
+        message: `Cancelled queued job '${jobId}'`,
+        job: next,
+      }
+    }
+
+    throw new Error(`Job '${jobId}' is not active or queued`)
+  }
+
+  async retryJobForCli(jobId: string) {
+    const job = await readJob(jobId)
+    if (!["failed", "interrupted", "cancelled"].includes(job.status)) {
+      throw new Error(`Job '${jobId}' is not retryable`)
+    }
+
+    const queue = await readJobQueue(job.bot_name)
+    if (queue.active_job_id === jobId || queue.pending_job_ids.includes(jobId)) {
+      throw new Error(`Job '${jobId}' is already active or queued`)
+    }
+
+    queue.pending_job_ids.push(jobId)
+    await writeJobQueue(queue)
+    const next = await writeJob({
+      ...job,
+      status: "queued",
+      turn_id: null,
+      started_at: null,
+      finished_at: null,
+      waiting_kind: null,
+      approval_request_id: null,
+      result_summary: null,
+      final_reply: null,
+      error: null,
+      cancel_requested: false,
+      artifacts: {
+        branch: null,
+        commit: null,
+        pr_url: null,
+        artifact_links: [],
+      },
+    })
+    const runtime = this.bots.get(job.bot_name)
+    if (runtime) {
+      this.kickWorker(runtime)
+    }
+    return {
+      message: `Requeued job '${jobId}'`,
+      job: next,
     }
   }
 
@@ -288,21 +395,24 @@ export class DiscordCodexSentinelService {
         name,
         config,
         client,
-        session: await this.normalizeRecoveredSession(name, await readBotSessionState(name)),
+        session: await this.normalizeRecoveredSession(await readBotSessionState(name)),
         threadLoaded: false,
-        activeTurn: null,
+        currentJob: null,
         promptWaiter: null,
         dmPollTimer: null,
+        workerLoop: null,
         inboundInFlightMessageIds: new Set(),
       }
 
       this.attachDiscordHandlers(runtime)
       await client.login(config.token)
-      this.startDmPolling(runtime)
-      this.bots.set(name, runtime)
       if (runtime.session.thread_id) {
         this.threadToBot.set(runtime.session.thread_id, name)
       }
+      this.bots.set(name, runtime)
+      await this.recoverOutstandingJobs(runtime)
+      this.startDmPolling(runtime)
+      this.kickWorker(runtime)
       await this.logger.info(`connected Discord bot ${name}`)
     }
   }
@@ -353,7 +463,7 @@ export class DiscordCodexSentinelService {
     }
 
     try {
-      if (runtime.promptWaiter) {
+      if (runtime.promptWaiter && runtime.currentJob && runtime.currentJob.jobId === runtime.promptWaiter.jobId) {
         const waiter = runtime.promptWaiter
         runtime.promptWaiter = null
         waiter.resolve(message.content.trim())
@@ -367,8 +477,10 @@ export class DiscordCodexSentinelService {
         return
       }
 
-      await this.startOrSteerTurn(runtime, message.content.trim())
+      const { job, ahead } = await this.enqueueJob(runtime, message)
+      await this.acknowledgeJob(runtime, message, job.id, ahead)
       await this.markInboundProcessed(runtime, message.id)
+      this.kickWorker(runtime)
     } finally {
       runtime.inboundInFlightMessageIds.delete(message.id)
     }
@@ -381,85 +493,217 @@ export class DiscordCodexSentinelService {
       case "!help":
         await message.reply(fitDiscordMessage("Commands: `!help`, `!status`, `!stop`, `!reset`"))
         return
-      case "!status":
-        await message.reply(
-          renderStatusMessage({
-            botName: runtime.name,
-            label: runtime.config.label,
-            threadId: runtime.session.thread_id,
-            turnId: runtime.session.active_turn_id,
-            status: runtime.session.last_status,
-            project: runtime.config.project ?? this.registryConfig?.default_project ?? process.cwd(),
-          }),
-        )
+      case "!status": {
+        const queue = await readJobQueue(runtime.name)
+        const activeJob = queue.active_job_id ? await readJob(queue.active_job_id).catch(() => null) : null
+        const lines = [
+          `**${runtime.config.label}** (\`${runtime.name}\`)`,
+          `Status: \`${runtime.session.last_status}\``,
+          `Project: \`${runtime.config.project ?? this.registryConfig?.default_project ?? process.cwd()}\``,
+          `Thread: ${runtime.session.thread_id ? `\`${runtime.session.thread_id}\`` : "_none_"}`,
+          `Active job: ${activeJob ? `\`${activeJob.id}\` (${activeJob.status})` : "_none_"}`,
+          `Queue depth: \`${queue.pending_job_ids.length}\``,
+        ]
+        await message.reply(fitDiscordMessage(lines.join("\n")))
         return
-      case "!stop":
-        if (!runtime.session.thread_id || !runtime.session.active_turn_id) {
-          await message.reply(fitDiscordMessage("No active turn."))
+      }
+      case "!stop": {
+        const activeJobId = runtime.session.active_job_id
+        if (!activeJobId) {
+          await message.reply(fitDiscordMessage("No active job."))
           return
         }
-        await this.codex.interruptTurn(runtime.session.thread_id, runtime.session.active_turn_id)
-        await message.reply(fitDiscordMessage("Interrupt sent."))
+        const job = await readJob(activeJobId)
+        await writeJob({ ...job, cancel_requested: true })
+        if (runtime.session.thread_id && runtime.session.active_turn_id) {
+          await this.codex.interruptTurn(runtime.session.thread_id, runtime.session.active_turn_id).catch(() => null)
+        }
+        await message.reply(fitDiscordMessage("Stop sent."))
         return
-      case "!reset":
+      }
+      case "!reset": {
+        const queue = await readJobQueue(runtime.name)
+        if (queue.active_job_id || queue.pending_job_ids.length > 0) {
+          await message.reply(fitDiscordMessage("Cannot reset while there is active or queued work."))
+          return
+        }
         await this.resetBotThread(runtime)
         await message.reply(fitDiscordMessage("Thread archived. The next message will start a fresh Codex thread."))
         return
+      }
       default:
         await message.reply(fitDiscordMessage("Unknown command."))
     }
   }
 
-  private async startOrSteerTurn(runtime: RuntimeBot, text: string) {
-    if (!text) return
+  private async enqueueJob(runtime: RuntimeBot, message: Message) {
+    const queue = await readJobQueue(runtime.name)
+    const ahead = (queue.active_job_id ? 1 : 0) + queue.pending_job_ids.length
+    const job = await createJob({
+      botName: runtime.name,
+      channelId: message.channel.id,
+      inputText: message.content.trim(),
+      requestMessageId: message.id,
+    })
+    queue.pending_job_ids.push(job.id)
+    await writeJobQueue(queue)
+    return { job, ahead }
+  }
 
-    const threadId = await this.ensureThread(runtime)
-    const channel = await this.getDmChannel(runtime)
-    await channel.sendTyping().catch(() => {})
+  private async acknowledgeJob(runtime: RuntimeBot, message: Message, jobId: string, ahead: number) {
+    const content = ahead === 0
+      ? "I’m on it."
+      : `I’m on it. Your request is queued behind ${ahead} other job${ahead === 1 ? "" : "s"}.`
+    await message.reply(fitDiscordMessage(`${content} Job: \`${jobId}\``))
+  }
 
-    if (runtime.activeTurn && runtime.session.active_turn_id) {
-      if (this.isTurnStale(runtime)) {
-        await this.recoverStalledTurn(runtime, "stale active turn detected before handling a new message", false)
-      }
-    }
-
-    if (runtime.activeTurn && runtime.session.active_turn_id) {
-      runtime.activeTurn.lastUserText = runtime.activeTurn.lastUserText
-        ? `${runtime.activeTurn.lastUserText.trim()}\n\n${text}`
-        : text
-      runtime.activeTurn.lastActivityAt = Date.now()
-      await this.codex.steerTurn({
-        threadId,
-        expectedTurnId: runtime.session.active_turn_id,
-        input: [this.textInput(text)],
-      })
-      await this.logger.info(`steered turn ${runtime.session.active_turn_id} for ${runtime.name}`)
+  private kickWorker(runtime: RuntimeBot) {
+    if (runtime.workerLoop || this.stopped) {
       return
     }
 
+    runtime.workerLoop = this.runWorker(runtime).finally(() => {
+      runtime.workerLoop = null
+      if (!this.stopped) {
+        void this.maybeContinueWorker(runtime)
+      }
+    })
+  }
+
+  private async maybeContinueWorker(runtime: RuntimeBot) {
+    if (runtime.currentJob) return
+    const queue = await readJobQueue(runtime.name)
+    if (!queue.active_job_id && queue.pending_job_ids.length > 0) {
+      this.kickWorker(runtime)
+    }
+  }
+
+  private async runWorker(runtime: RuntimeBot) {
+    while (!this.stopped && !runtime.currentJob) {
+      const queue = await readJobQueue(runtime.name)
+
+      if (queue.active_job_id) {
+        await this.markPersistedActiveJobInterrupted(runtime, queue.active_job_id, "Worker restarted before job completed.")
+        continue
+      }
+
+      const nextJobId = queue.pending_job_ids.shift()
+      if (!nextJobId) {
+        return
+      }
+
+      const job = await readJob(nextJobId).catch(() => null)
+      if (!job) {
+        await writeJobQueue(queue)
+        continue
+      }
+
+      if (job.cancel_requested) {
+        await writeJob({
+          ...job,
+          status: "cancelled",
+          finished_at: new Date().toISOString(),
+          error: "Cancelled before execution",
+        })
+        await writeJobQueue(queue)
+        continue
+      }
+
+      queue.active_job_id = nextJobId
+      await writeJobQueue(queue)
+
+      const startedAt = job.started_at ?? new Date().toISOString()
+      await writeJob({
+        ...job,
+        status: "running",
+        started_at: startedAt,
+        finished_at: null,
+        waiting_kind: null,
+        approval_request_id: null,
+        error: null,
+        cancel_requested: false,
+      })
+
+      runtime.session.active_job_id = job.id
+      runtime.session.last_status = "running"
+      await writeBotSessionState(runtime.name, runtime.session)
+
+      try {
+        await this.startJob(runtime, job.id)
+      } catch (error) {
+        await this.failJobStart(runtime, job.id, String(error))
+      }
+
+      return
+    }
+  }
+
+  private async startJob(runtime: RuntimeBot, jobId: string) {
+    const job = await readJob(jobId)
+    const threadId = await this.ensureThread(runtime)
+    const channel = await this.getDmChannel(runtime)
+    await channel.sendTyping().catch(() => null)
+
     const response = await this.codex.startTurn({
       threadId,
-      input: [this.textInput(text)],
+      input: [this.textInput(job.input_text)],
       model: runtime.config.model ?? this.registryConfig?.default_model ?? null,
       effort: runtime.config.effort ?? this.registryConfig?.default_effort ?? null,
     })
 
-    runtime.activeTurn = {
+    runtime.currentJob = {
+      jobId,
       turnId: response.turn.id,
-      planText: "",
       replyText: "",
-      lastUserText: text,
-      lastActivityAt: Date.now(),
-      workingMessageId: null,
-      flushTimer: null,
       typingTimer: this.startTypingLoop(runtime),
-      recovering: false,
-      activityMessages: new Map(),
+      cancelIssued: false,
     }
+
     runtime.session.active_turn_id = response.turn.id
+    runtime.session.active_job_id = jobId
     runtime.session.last_status = "running"
     await writeBotSessionState(runtime.name, runtime.session)
-    await this.logger.info(`started turn ${response.turn.id} for ${runtime.name}`)
+
+    await writeJob({
+      ...job,
+      status: "running",
+      thread_id: threadId,
+      turn_id: response.turn.id,
+      started_at: job.started_at ?? new Date().toISOString(),
+      waiting_kind: null,
+      approval_request_id: null,
+      error: null,
+    })
+
+    await this.logger.info(`started job ${jobId} turn ${response.turn.id} for ${runtime.name}`)
+  }
+
+  private async failJobStart(runtime: RuntimeBot, jobId: string, error: string) {
+    const queue = await readJobQueue(runtime.name)
+    if (queue.active_job_id === jobId) {
+      queue.active_job_id = null
+      await writeJobQueue(queue)
+    }
+
+    const job = await readJob(jobId)
+    await writeJob({
+      ...job,
+      status: "failed",
+      finished_at: new Date().toISOString(),
+      error,
+    })
+
+    runtime.session.active_job_id = null
+    runtime.session.active_turn_id = null
+    runtime.session.last_status = "errored"
+    await writeBotSessionState(runtime.name, runtime.session)
+
+    const channel = await this.getDmChannel(runtime).catch(() => null)
+    if (channel) {
+      for (const chunk of chunkText(`I couldn’t start job \`${jobId}\`: ${error}`)) {
+        await channel.send(chunk)
+      }
+    }
   }
 
   private async ensureThread(runtime: RuntimeBot) {
@@ -509,10 +753,11 @@ export class DiscordCodexSentinelService {
       await this.codex.archiveThread(runtime.session.thread_id)
       this.threadToBot.delete(runtime.session.thread_id)
     }
-    this.clearActiveTurn(runtime)
+    this.clearCurrentJob(runtime)
     runtime.session = {
       thread_id: null,
       active_turn_id: null,
+      active_job_id: null,
       last_discord_channel_id: runtime.session.last_discord_channel_id,
       last_inbound_message_id: runtime.session.last_inbound_message_id,
       last_working_message_id: null,
@@ -538,29 +783,18 @@ export class DiscordCodexSentinelService {
         )
         return
       case "item/agentMessage/delta":
-        await this.onDelta(notification.params as DeltaNotification, "reply")
+        await this.onDelta(notification.params as DeltaNotification)
         return
       case "item/plan/delta":
-        await this.onDelta(notification.params as DeltaNotification, "plan")
         return
       case "item/commandExecution/outputDelta":
-        await this.onActivityDelta(notification.params as DeltaNotification, "command")
-        return
       case "item/fileChange/outputDelta":
-        await this.onActivityDelta(notification.params as DeltaNotification, "file")
         return
       case "serverRequest/resolved":
         await this.disableApproval((notification.params as { requestId: JsonRpcId }).requestId)
         return
       case "thread/status/changed":
-        {
-          const threadId = (notification.params as { threadId: string }).threadId
-          const runtime = this.findRuntimeByThreadId(threadId)
-          if (runtime?.activeTurn) {
-            runtime.activeTurn.lastActivityAt = Date.now()
-          }
-          await this.logger.info(`thread status changed ${threadId}`)
-        }
+        await this.logger.info(`thread status changed ${(notification.params as { threadId: string }).threadId}`)
         return
       default:
         return
@@ -584,211 +818,141 @@ export class DiscordCodexSentinelService {
       case "item/tool/requestUserInput":
         await this.handleUserInputRequest(request.id, request.params as { threadId: string; questions: ToolRequestUserInputQuestion[] })
         return
-      default:
+      default: {
         await this.codex.respondError(request.id, `Unsupported server request: ${request.method}`)
-        const runtime = this.findRuntimeByUnknownRequest(request.params as any)
+        const runtime = this.findRuntimeByUnknownRequest(request.params as Record<string, unknown>)
         if (runtime) {
           const channel = await this.getDmChannel(runtime)
           await channel.send(fitDiscordMessage(`Codex requested an unsupported capability: \`${request.method}\``))
         }
+      }
     }
   }
 
   private async handleCodexExit() {
     if (this.stopped) return
     await this.logger.warn("restarting Codex app-server")
+
     for (const runtime of this.bots.values()) {
+      await this.markCurrentJobInterrupted(runtime, "Codex app-server exited unexpectedly.", true)
       runtime.threadLoaded = false
-      this.clearActiveTurn(runtime)
-      runtime.session.active_turn_id = null
       runtime.session.last_status = "errored"
       await writeBotSessionState(runtime.name, runtime.session)
     }
 
     await new Promise(resolve => setTimeout(resolve, 2000))
     await this.codex.start()
+
+    for (const runtime of this.bots.values()) {
+      this.kickWorker(runtime)
+    }
   }
 
   private async onTurnStarted(threadId: string, turnId: string) {
     const runtime = this.findRuntimeByThreadId(threadId)
-    if (!runtime) return
-    if (!runtime.activeTurn) {
-      runtime.activeTurn = {
-        turnId,
-        planText: "",
-        replyText: "",
-        lastUserText: "",
-        lastActivityAt: Date.now(),
-        workingMessageId: null,
-        flushTimer: null,
-        typingTimer: this.startTypingLoop(runtime),
-        recovering: false,
-        activityMessages: new Map(),
-      }
-    }
-    runtime.activeTurn.lastActivityAt = Date.now()
-    runtime.activeTurn.recovering = false
+    if (!runtime?.currentJob) return
+
+    runtime.currentJob.turnId = turnId
     runtime.session.active_turn_id = turnId
+    runtime.session.active_job_id = runtime.currentJob.jobId
     runtime.session.last_status = "running"
     await writeBotSessionState(runtime.name, runtime.session)
+
+    const job = await readJob(runtime.currentJob.jobId)
+    await writeJob({
+      ...job,
+      turn_id: turnId,
+      status: "running",
+      started_at: job.started_at ?? new Date().toISOString(),
+    })
   }
 
   private async onTurnCompleted(threadId: string, turn: { id: string; status: string; error?: { message?: string } | null }) {
     const runtime = this.findRuntimeByThreadId(threadId)
-    if (!runtime) return
+    if (!runtime?.currentJob) return
+
+    const job = await readJob(runtime.currentJob.jobId)
+    const fullReply = runtime.currentJob.replyText.trim()
+
+    let status: JobRecord["status"]
+    if (turn.status === "failed") {
+      status = "failed"
+    } else if (turn.status === "interrupted") {
+      status = job.cancel_requested ? "cancelled" : "interrupted"
+    } else {
+      status = "completed"
+    }
+
+    const finalJob = await writeJob({
+      ...job,
+      status,
+      turn_id: turn.id,
+      finished_at: new Date().toISOString(),
+      waiting_kind: null,
+      approval_request_id: null,
+      final_reply: fullReply || null,
+      result_summary: this.summarizeJobResult(fullReply, turn.error?.message ?? null, status),
+      error: turn.error?.message ?? (status === "cancelled" ? "Cancelled by user" : null),
+    })
+
+    const queue = await readJobQueue(runtime.name)
+    if (queue.active_job_id === finalJob.id) {
+      queue.active_job_id = null
+      await writeJobQueue(queue)
+    }
 
     runtime.session.active_turn_id = null
-    runtime.session.last_status = turn.status === "failed" ? "errored" : "idle"
+    runtime.session.active_job_id = null
+    runtime.session.last_status = status === "failed" ? "errored" : "idle"
     await writeBotSessionState(runtime.name, runtime.session)
 
-    if (runtime.activeTurn) {
-      const completedTurn = runtime.activeTurn
-      if (completedTurn.typingTimer) {
-        clearInterval(completedTurn.typingTimer)
-        completedTurn.typingTimer = null
-      }
-      const fullReply = completedTurn.replyText.trim()
-      if (completedTurn.workingMessageId) {
-        await this.flushWorkingMessage(runtime, true)
-      } else if (fullReply) {
-        const channel = await this.getDmChannel(runtime)
-        const chunks = chunkText(fullReply)
-        if (chunks.length > 0) {
-          const first = await channel.send(chunks[0]!)
-          runtime.session.last_working_message_id = first.id
-          await writeBotSessionState(runtime.name, runtime.session)
-          for (const chunk of chunks.slice(1)) {
-            await channel.send(chunk)
-          }
-        }
-      }
-      const chunks = chunkText(fullReply)
-      if (completedTurn.workingMessageId && chunks.length > 1) {
-        const channel = await this.getDmChannel(runtime)
-        for (const chunk of chunks.slice(1)) {
-          await channel.send(chunk)
-        }
-      }
-      if (completedTurn.lastUserText.trim() || fullReply) {
+    this.clearCurrentJob(runtime)
+
+    if (status === "completed") {
+      await this.sendJobCompletion(runtime, finalJob)
+      if (finalJob.input_text.trim() || fullReply) {
         await appendMemoryJournal(runtime.name, {
-          user: completedTurn.lastUserText,
+          user: finalJob.input_text,
           assistant: fullReply,
         })
       }
-      runtime.activeTurn = null
-    }
-
-    if (turn.status === "failed") {
-      const channel = await this.getDmChannel(runtime)
-      for (const chunk of chunkText(`Turn failed${turn.error?.message ? `: ${turn.error.message}` : "."}`)) {
-        await channel.send(chunk)
-      }
-    }
-  }
-
-  private async onDelta(notification: DeltaNotification, kind: "plan" | "reply") {
-    const runtime = this.findRuntimeByThreadId(notification.threadId)
-    if (!runtime?.activeTurn) return
-
-    if (kind === "plan") {
-      runtime.activeTurn.planText += notification.delta
     } else {
-      runtime.activeTurn.replyText += notification.delta
+      await this.sendJobFailure(runtime, finalJob)
     }
-    runtime.activeTurn.lastActivityAt = Date.now()
-    this.scheduleFlush(runtime)
+
+    this.kickWorker(runtime)
   }
 
-  private async onActivityDelta(notification: DeltaNotification, kind: "command" | "file") {
+  private async onDelta(notification: DeltaNotification) {
     const runtime = this.findRuntimeByThreadId(notification.threadId)
-    if (!runtime?.activeTurn) return
-
-    const current = runtime.activeTurn.activityMessages.get(notification.itemId) ?? {
-      kind,
-      text: "",
-      messageId: null,
-    }
-    current.text += notification.delta
-    runtime.activeTurn.activityMessages.set(notification.itemId, current)
-    runtime.activeTurn.lastActivityAt = Date.now()
-    this.scheduleFlush(runtime)
-  }
-
-  private scheduleFlush(runtime: RuntimeBot) {
-    if (!runtime.activeTurn) return
-    if (runtime.activeTurn.flushTimer) return
-    runtime.activeTurn.flushTimer = setTimeout(() => {
-      void this.emitProgressHint(runtime)
-    }, 750)
-  }
-
-  private async flushWorkingMessage(runtime: RuntimeBot, final = false) {
-    if (!runtime.activeTurn) return
-    if (runtime.activeTurn.flushTimer) {
-      clearTimeout(runtime.activeTurn.flushTimer)
-      runtime.activeTurn.flushTimer = null
-    }
-
-    const activeTurn = runtime.activeTurn
-    if (!activeTurn.workingMessageId) {
-      return
-    }
-
-    const working = await this.getOrCreateWorkingMessage(runtime)
-    if (!runtime.activeTurn || runtime.activeTurn.turnId !== activeTurn.turnId) {
-      return
-    }
-
-    const content = renderWorkingMessage(activeTurn.planText, activeTurn.replyText)
-    await working.edit(fitDiscordMessage(content))
-
-    if (final) {
-      runtime.session.last_working_message_id = working.id
-      await writeBotSessionState(runtime.name, runtime.session)
-    }
-  }
-
-  private async getOrCreateWorkingMessage(runtime: RuntimeBot) {
-    const channel = await this.getDmChannel(runtime)
-    const existingId = runtime.activeTurn?.workingMessageId ?? null
-    if (existingId) {
-      const existing = await channel.messages.fetch(existingId).catch(() => null)
-      if (existing) {
-        return existing
-      }
-    }
-
-    const created = await channel.send("_Working..._")
-    if (runtime.activeTurn) {
-      runtime.activeTurn.workingMessageId = created.id
-    }
-    runtime.session.last_working_message_id = created.id
-    await writeBotSessionState(runtime.name, runtime.session)
-    return created
+    if (!runtime?.currentJob) return
+    runtime.currentJob.replyText += notification.delta
   }
 
   private startTypingLoop(runtime: RuntimeBot) {
-    const timer = setInterval(() => {
-      void this.emitProgressHint(runtime)
+    return setInterval(() => {
+      void this.tickCurrentJob(runtime)
     }, 4000)
-
-    return timer
   }
 
-  private async emitProgressHint(runtime: RuntimeBot) {
-    if (!runtime.activeTurn) return
-    if (this.isTurnStale(runtime)) {
-      await this.recoverStalledTurn(runtime, `no Codex activity for ${Math.round(TURN_STALL_TIMEOUT_MS / 1000)} seconds`, true)
+  private async tickCurrentJob(runtime: RuntimeBot) {
+    if (!runtime.currentJob) return
+    const persisted = await readJob(runtime.currentJob.jobId).catch(() => null)
+    if (!persisted) return
+
+    if (persisted.cancel_requested && !runtime.currentJob.cancelIssued && runtime.session.thread_id && runtime.session.active_turn_id) {
+      runtime.currentJob.cancelIssued = true
+      await this.logger.info(`interrupting job ${persisted.id} after cancellation request`)
+      await this.codex.interruptTurn(runtime.session.thread_id, runtime.session.active_turn_id).catch(error => {
+        runtime.currentJob!.cancelIssued = false
+        void this.logger.warn(`failed to interrupt job ${persisted.id}: ${String(error)}`)
+      })
       return
-    }
-    if (runtime.activeTurn.flushTimer) {
-      clearTimeout(runtime.activeTurn.flushTimer)
-      runtime.activeTurn.flushTimer = null
     }
 
     const channel = await this.getDmChannel(runtime).catch(() => null)
     if (!channel) return
-    await channel.sendTyping().catch(() => {})
+    await channel.sendTyping().catch(() => null)
   }
 
   private async createApprovalPrompt(
@@ -803,18 +967,22 @@ export class DiscordCodexSentinelService {
     const runtime = legacy
       ? this.findRuntimeByThreadId("conversationId" in params ? params.conversationId : "")
       : this.findRuntimeByThreadId("threadId" in params ? params.threadId : "")
-    if (!runtime) {
+    if (!runtime?.currentJob) {
       await this.respondToApproval(requestId, "cancel", legacy, "approval target not found", {
         approvalId: "approvalId" in params ? params.approvalId ?? null : null,
       })
       return
     }
 
+    const job = await readJob(runtime.currentJob.jobId)
+    await writeJob({
+      ...job,
+      status: "waiting_approval",
+      waiting_kind: "approval",
+      approval_request_id: String(requestId),
+    })
     runtime.session.last_status = "waiting_approval"
     await writeBotSessionState(runtime.name, runtime.session)
-    if (runtime.activeTurn) {
-      runtime.activeTurn.lastActivityAt = Date.now()
-    }
 
     const channel = await this.getDmChannel(runtime)
     const availableDecisions = this.getAvailableApprovalDecisions(params, legacy)
@@ -827,9 +995,11 @@ export class DiscordCodexSentinelService {
     const timeout = setTimeout(() => {
       void this.expireApproval(String(requestId))
     }, timeoutMs)
+
     this.approvals.set(String(requestId), {
       requestId: String(requestId),
       botName: runtime.name,
+      jobId: runtime.currentJob.jobId,
       channelId: channel.id,
       discordMessageId: message.id,
       approvalId: "approvalId" in params ? params.approvalId ?? null : null,
@@ -969,12 +1139,6 @@ export class DiscordCodexSentinelService {
     const pending = this.approvals.get(requestId)
     if (!pending) return
 
-    const runtime = this.bots.get(pending.botName)
-    if (!runtime) {
-      await this.disableApproval(requestId, "_Timed out._")
-      return
-    }
-
     try {
       await this.respondToApproval(requestId, "cancel", pending.legacy, "approval timeout", {
         approvalId: pending.approvalId,
@@ -995,6 +1159,21 @@ export class DiscordCodexSentinelService {
     }
 
     const runtime = this.bots.get(pending.botName)
+    const job = await readJob(pending.jobId).catch(() => null)
+    if (job && ["waiting_approval", "running"].includes(job.status)) {
+      await writeJob({
+        ...job,
+        status: runtime?.currentJob?.jobId === job.id ? "running" : job.status,
+        waiting_kind: null,
+        approval_request_id: null,
+      })
+    }
+
+    if (runtime) {
+      runtime.session.last_status = runtime.currentJob ? "running" : "idle"
+      await writeBotSessionState(runtime.name, runtime.session)
+    }
+
     if (!runtime) return
 
     const channel = await this.getDmChannel(runtime)
@@ -1002,36 +1181,55 @@ export class DiscordCodexSentinelService {
     if (!message) return
 
     await message.edit({ content: appendDiscordSuffix(message.content, suffix), components: [] })
-    runtime.session.last_status = runtime.session.active_turn_id ? "running" : "idle"
-    await writeBotSessionState(runtime.name, runtime.session)
   }
 
   private async handleUserInputRequest(requestId: JsonRpcId, params: { threadId: string; questions: ToolRequestUserInputQuestion[] }) {
     const runtime = this.findRuntimeByThreadId(params.threadId)
-    if (!runtime) {
+    if (!runtime?.currentJob) {
       await this.codex.respondError(requestId, "Unknown thread for user input request")
       return
     }
 
+    const job = await readJob(runtime.currentJob.jobId)
+    await writeJob({
+      ...job,
+      status: "waiting_input",
+      waiting_kind: "input",
+    })
+    runtime.session.last_status = "waiting_input"
+    await writeBotSessionState(runtime.name, runtime.session)
+
     const answers: Record<string, { answers: string[] }> = {}
     for (const question of params.questions) {
-      if (runtime.activeTurn) {
-        runtime.activeTurn.lastActivityAt = Date.now()
-      }
       const answer = await this.askQuestion(runtime, question)
       answers[question.id] = { answers: [answer] }
     }
 
     await this.codex.respond(requestId, { answers })
+    const updated = await readJob(runtime.currentJob.jobId).catch(() => null)
+    if (updated) {
+      await writeJob({
+        ...updated,
+        status: "running",
+        waiting_kind: null,
+      })
+    }
+    runtime.session.last_status = "running"
+    await writeBotSessionState(runtime.name, runtime.session)
   }
 
   private async askQuestion(runtime: RuntimeBot, question: ToolRequestUserInputQuestion) {
+    if (!runtime.currentJob) {
+      throw new Error("No active job for user input")
+    }
+
     const channel = await this.getDmChannel(runtime)
     const options = (question.options ?? []).map(option => `${option.label} — ${option.description}`)
     await channel.send(renderQuestionPrompt(question.header, question.question, options))
 
     return new Promise<string>(resolve => {
       runtime.promptWaiter = {
+        jobId: runtime.currentJob!.jobId,
         header: question.header,
         resolve: raw => {
           const trimmed = raw.trim()
@@ -1081,7 +1279,7 @@ export class DiscordCodexSentinelService {
     return this.bots.get(botName) ?? null
   }
 
-  private findRuntimeByUnknownRequest(params: any) {
+  private findRuntimeByUnknownRequest(params: Record<string, unknown>) {
     const threadId =
       (typeof params?.threadId === "string" && params.threadId) ||
       (typeof params?.conversationId === "string" && params.conversationId) ||
@@ -1115,7 +1313,10 @@ export class DiscordCodexSentinelService {
     if (!runtime.client.isReady()) return
 
     const channel = await this.getDmChannel(runtime).catch(() => null)
-    if (!channel) return
+    if (!channel) {
+      await this.maybeContinueWorker(runtime)
+      return
+    }
 
     if (runtime.session.last_discord_channel_id !== channel.id) {
       runtime.session.last_discord_channel_id = channel.id
@@ -1142,6 +1343,8 @@ export class DiscordCodexSentinelService {
         void this.logger.error(`failed to process polled DM for ${runtime.name}: ${String(error)}`)
       })
     }
+
+    await this.maybeContinueWorker(runtime)
   }
 
   private isSnowflakeAfter(left: string, right: string | null) {
@@ -1177,62 +1380,124 @@ export class DiscordCodexSentinelService {
     return true
   }
 
-  private clearActiveTurn(runtime: RuntimeBot) {
-    if (runtime.activeTurn?.flushTimer) {
-      clearTimeout(runtime.activeTurn.flushTimer)
+  private clearCurrentJob(runtime: RuntimeBot) {
+    if (runtime.currentJob?.typingTimer) {
+      clearInterval(runtime.currentJob.typingTimer)
     }
-    if (runtime.activeTurn?.typingTimer) {
-      clearInterval(runtime.activeTurn.typingTimer)
-    }
-    runtime.activeTurn = null
+    runtime.currentJob = null
+    runtime.promptWaiter = null
   }
 
-  private isTurnStale(runtime: RuntimeBot) {
-    if (!runtime.activeTurn) return false
-    if (runtime.promptWaiter) return false
-    if (runtime.session.last_status === "waiting_approval") return false
-    return Date.now() - runtime.activeTurn.lastActivityAt >= TURN_STALL_TIMEOUT_MS
-  }
-
-  private async recoverStalledTurn(runtime: RuntimeBot, reason: string, notifyUser: boolean) {
-    const activeTurn = runtime.activeTurn
-    if (!activeTurn || activeTurn.recovering) {
-      return false
+  private async recoverOutstandingJobs(runtime: RuntimeBot) {
+    const queue = await readJobQueue(runtime.name)
+    if (!queue.active_job_id) {
+      return
     }
 
-    activeTurn.recovering = true
-    await this.logger.warn(`recovering stalled turn ${activeTurn.turnId} for ${runtime.name}: ${reason}`)
+    const interruptedJobId = queue.active_job_id
+    await this.markPersistedActiveJobInterrupted(runtime, interruptedJobId, "The daemon restarted while this job was running.")
+  }
 
-    let restartedCodex = false
-    if (runtime.session.thread_id && runtime.session.active_turn_id) {
-      try {
-        await Promise.race([
-          this.codex.interruptTurn(runtime.session.thread_id, runtime.session.active_turn_id),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("interrupt timeout")), INTERRUPT_TIMEOUT_MS)),
-        ])
-      } catch (error) {
-        await this.logger.warn(`interrupt failed for stalled turn ${activeTurn.turnId}: ${String(error)}`)
-        if (this.codex.isRunning()) {
-          restartedCodex = true
-          await this.codex.stop()
-        }
+  private async markPersistedActiveJobInterrupted(runtime: RuntimeBot, jobId: string, reason: string) {
+    const queue = await readJobQueue(runtime.name)
+    const job = await readJob(jobId).catch(() => null)
+    if (job) {
+      await writeJob({
+        ...job,
+        status: "interrupted",
+        finished_at: new Date().toISOString(),
+        waiting_kind: null,
+        approval_request_id: null,
+        error: reason,
+      })
+    }
+    if (queue.active_job_id === jobId) {
+      queue.active_job_id = null
+      await writeJobQueue(queue)
+    }
+
+    runtime.session.active_job_id = null
+    runtime.session.active_turn_id = null
+    runtime.session.last_status = "idle"
+    await writeBotSessionState(runtime.name, runtime.session)
+
+    if (job) {
+      const channel = await this.getDmChannel(runtime).catch(() => null)
+      if (channel) {
+        await channel.send(fitDiscordMessage(`Job \`${job.id}\` was interrupted. Ask again or retry it from the CLI/plugin.`)).catch(() => null)
       }
     }
+  }
 
-    this.clearActiveTurn(runtime)
-    runtime.threadLoaded = runtime.session.thread_id ? !restartedCodex : false
+  private async markCurrentJobInterrupted(runtime: RuntimeBot, reason: string, notifyUser: boolean) {
+    if (!runtime.currentJob) {
+      return
+    }
+
+    const job = await readJob(runtime.currentJob.jobId).catch(() => null)
+    if (job) {
+      await writeJob({
+        ...job,
+        status: "interrupted",
+        finished_at: new Date().toISOString(),
+        waiting_kind: null,
+        approval_request_id: null,
+        error: reason,
+      })
+    }
+
+    const queue = await readJobQueue(runtime.name)
+    if (queue.active_job_id === runtime.currentJob.jobId) {
+      queue.active_job_id = null
+      await writeJobQueue(queue)
+    }
+
+    runtime.session.active_job_id = null
     runtime.session.active_turn_id = null
-    runtime.session.last_status = restartedCodex ? "errored" : "idle"
+    runtime.session.last_status = "idle"
     await writeBotSessionState(runtime.name, runtime.session)
+
+    const currentJobId = runtime.currentJob.jobId
+    this.clearCurrentJob(runtime)
 
     if (notifyUser) {
       const channel = await this.getDmChannel(runtime).catch(() => null)
       if (channel) {
-        await channel.send(fitDiscordMessage("I got stuck on the last turn and reset myself. Send that again."))
+        await channel.send(fitDiscordMessage(`Job \`${currentJobId}\` was interrupted. Ask again or retry it from the CLI/plugin.`)).catch(() => null)
       }
     }
+  }
 
-    return true
+  private async sendJobCompletion(runtime: RuntimeBot, job: JobRecord) {
+    const channel = await this.getDmChannel(runtime)
+    const body = job.final_reply?.trim() || `Done. Job \`${job.id}\` completed.`
+    for (const chunk of chunkText(body)) {
+      await channel.send(chunk)
+    }
+  }
+
+  private async sendJobFailure(runtime: RuntimeBot, job: JobRecord) {
+    const channel = await this.getDmChannel(runtime)
+    const prefix =
+      job.status === "cancelled"
+        ? `Job \`${job.id}\` was cancelled.`
+        : job.status === "interrupted"
+          ? `Job \`${job.id}\` was interrupted.`
+          : `Job \`${job.id}\` failed.`
+    const body = job.error ? `${prefix}\n\n${job.error}` : prefix
+    for (const chunk of chunkText(body)) {
+      await channel.send(chunk)
+    }
+  }
+
+  private summarizeJobResult(reply: string, error: string | null, status: JobRecord["status"]) {
+    if (reply.trim()) {
+      return fitDiscordMessage(reply.trim().split("\n\n")[0] ?? reply.trim(), 400)
+    }
+    if (error) {
+      return fitDiscordMessage(error, 400)
+    }
+    return fitDiscordMessage(`Job ${status}.`, 400)
   }
 
   private teardownRuntime(runtime: RuntimeBot) {
@@ -1240,7 +1505,7 @@ export class DiscordCodexSentinelService {
       clearInterval(runtime.dmPollTimer)
       runtime.dmPollTimer = null
     }
-    this.clearActiveTurn(runtime)
+    this.clearCurrentJob(runtime)
     if (runtime.session.thread_id) {
       this.threadToBot.delete(runtime.session.thread_id)
     }
@@ -1264,19 +1529,18 @@ export class DiscordCodexSentinelService {
     }
   }
 
-  private async normalizeRecoveredSession(name: string, session: BotSessionState) {
-    if (!session.active_turn_id && session.last_status !== "running" && session.last_status !== "waiting_approval") {
+  private async normalizeRecoveredSession(session: BotSessionState) {
+    if (!session.active_turn_id && !session.active_job_id && !["running", "waiting_approval", "waiting_input"].includes(session.last_status)) {
       return session
     }
 
-    const normalized: BotSessionState = {
+    return {
       ...session,
       active_turn_id: null,
-      last_status: "idle",
+      active_job_id: null,
+      last_status: "idle" as const,
       updated_at: new Date().toISOString(),
     }
-    await writeBotSessionState(name, normalized)
-    return normalized
   }
 
   private async buildDeveloperInstructions(botName: string) {

@@ -14,6 +14,10 @@ function usage() {
     "  bun src/index.ts bot add <name> <token> [project]",
     "  bun src/index.ts bot remove <name>",
     "  bun src/index.ts bot list",
+    "  bun src/index.ts job list [bot]",
+    "  bun src/index.ts job show <job-id>",
+    "  bun src/index.ts job cancel <job-id>",
+    "  bun src/index.ts job retry <job-id>",
     "  bun src/index.ts thread reset <name>",
     "  bun src/index.ts mcp serve",
   ].join("\n")
@@ -46,6 +50,7 @@ async function main() {
             for (const entry of status.entries) {
               console.log(
                 `${entry.name}\t${entry.config.label}\t${entry.session.last_status}\t${entry.session.thread_id ?? "-"}`,
+                `\tactive_job=${entry.session.active_job_id ?? "-"}\tqueue=${entry.queue_depth}`,
               )
             }
             return
@@ -117,6 +122,40 @@ async function main() {
         await service.resetThreadForCli(rest[0])
         console.log(`Reset thread for '${rest[0]}'`)
         return
+      }
+      case "job": {
+        switch (subcommand) {
+          case "list": {
+            const [botName] = rest
+            const jobs = await service.listJobsForCli(botName)
+            for (const job of jobs) {
+              console.log(`${job.id}\t${job.bot_name}\t${job.status}\t${job.created_at}`)
+            }
+            return
+          }
+          case "show": {
+            const [jobId] = rest
+            if (!jobId) throw new Error("job show requires <job-id>")
+            console.log(JSON.stringify(await service.showJobForCli(jobId), null, 2))
+            return
+          }
+          case "cancel": {
+            const [jobId] = rest
+            if (!jobId) throw new Error("job cancel requires <job-id>")
+            const result = await service.cancelJobForCli(jobId)
+            console.log(result.message)
+            return
+          }
+          case "retry": {
+            const [jobId] = rest
+            if (!jobId) throw new Error("job retry requires <job-id>")
+            const result = await service.retryJobForCli(jobId)
+            console.log(result.message)
+            return
+          }
+          default:
+            throw new Error("unknown job subcommand")
+        }
       }
       case "mcp": {
         if (subcommand !== "serve") {

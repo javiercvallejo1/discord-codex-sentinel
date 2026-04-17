@@ -1,20 +1,26 @@
 import {
   mkdir,
+  readdir,
   readFile,
   rm,
   writeFile,
 } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { resolve } from "node:path"
 import {
   BOTS_FILE,
+  getJobPath,
+  getQueuePath,
   getMemoryJournalPath,
   getMemoryPath,
   getPersonalityPath,
   getSessionStatePath,
+  JOBS_DIR,
   LOGS_DIR,
   MEMORY_DIR,
   MEMORY_JOURNAL_DIR,
   PERSONALITIES_DIR,
+  QUEUES_DIR,
   SESSION_STATE_DIR,
   STATE_ROOT,
 } from "./paths"
@@ -24,6 +30,10 @@ import {
   DEFAULT_PERSONALITY,
   type BotConfig,
   type BotSessionState,
+  type JobQueueState,
+  type JobRecord,
+  jobQueueSchema,
+  jobRecordSchema,
   type NamedBot,
   type RegistryConfig,
   registryConfigSchema,
@@ -37,6 +47,8 @@ export async function ensureStateDirs() {
     mkdir(SESSION_STATE_DIR, { recursive: true }),
     mkdir(MEMORY_DIR, { recursive: true }),
     mkdir(MEMORY_JOURNAL_DIR, { recursive: true }),
+    mkdir(JOBS_DIR, { recursive: true }),
+    mkdir(QUEUES_DIR, { recursive: true }),
     mkdir(LOGS_DIR, { recursive: true }),
   ])
 }
@@ -97,6 +109,7 @@ export async function removeBot(name: string) {
     rm(getPersonalityPath(name), { force: true }),
     rm(getMemoryPath(name), { force: true }),
     rm(getMemoryJournalPath(name), { force: true }),
+    rm(getQueuePath(name), { force: true }),
   ])
 }
 
@@ -216,6 +229,78 @@ export async function writeBotSessionState(botName: string, state: BotSessionSta
 
 export async function clearBotSessionState(botName: string) {
   await rm(getSessionStatePath(botName), { force: true })
+}
+
+export async function readJob(jobId: string): Promise<JobRecord> {
+  await ensureStateDirs()
+  const raw = await readFile(getJobPath(jobId), "utf8")
+  return jobRecordSchema.parse(JSON.parse(raw))
+}
+
+export async function writeJob(job: JobRecord) {
+  await ensureStateDirs()
+  const next = jobRecordSchema.parse({
+    ...job,
+    request_message_ids: [...job.request_message_ids],
+  })
+  await writeFile(getJobPath(job.id), `${JSON.stringify(next, null, 2)}\n`, "utf8")
+  return next
+}
+
+export async function readJobQueue(botName: string): Promise<JobQueueState> {
+  await ensureStateDirs()
+  const path = getQueuePath(botName)
+
+  try {
+    const raw = await readFile(path, "utf8")
+    return jobQueueSchema.parse(JSON.parse(raw))
+  } catch {
+    const fresh = jobQueueSchema.parse({ bot_name: botName })
+    await writeJobQueue(fresh)
+    return fresh
+  }
+}
+
+export async function writeJobQueue(queue: JobQueueState) {
+  await ensureStateDirs()
+  const next = jobQueueSchema.parse(queue)
+  await writeFile(getQueuePath(queue.bot_name), `${JSON.stringify(next, null, 2)}\n`, "utf8")
+  return next
+}
+
+export async function createJob(input: {
+  botName: string
+  channelId: string
+  inputText: string
+  requestMessageId: string
+}) {
+  const job = jobRecordSchema.parse({
+    id: randomUUID(),
+    bot_name: input.botName,
+    channel_id: input.channelId,
+    request_message_ids: [input.requestMessageId],
+    input_text: input.inputText,
+    status: "queued",
+  })
+  await writeJob(job)
+  return job
+}
+
+export async function listJobs(botName?: string) {
+  await ensureStateDirs()
+  const ids = (await readdir(JOBS_DIR, { withFileTypes: true }))
+    .filter(entry => entry.isFile() && entry.name.endsWith(".json"))
+    .map(entry => entry.name.replace(/\.json$/, ""))
+
+  const jobs = await Promise.all(ids.map(id => readJob(id).catch(() => null)))
+  return jobs
+    .filter((job): job is JobRecord => Boolean(job))
+    .filter(job => (botName ? job.bot_name === botName : true))
+    .sort((left, right) => left.created_at.localeCompare(right.created_at))
+}
+
+export async function deleteJob(jobId: string) {
+  await rm(getJobPath(jobId), { force: true })
 }
 
 export function resolveProjectPath(project: string) {

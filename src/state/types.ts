@@ -50,17 +50,69 @@ export const sessionStatusSchema = z.enum([
   "idle",
   "running",
   "waiting_approval",
+  "waiting_input",
   "errored",
 ])
 
 export const botSessionStateSchema = z.object({
   thread_id: z.string().nullable().default(null),
   active_turn_id: z.string().nullable().default(null),
+  active_job_id: z.string().nullable().default(null),
   last_discord_channel_id: z.string().nullable().default(null),
   last_inbound_message_id: z.string().nullable().default(null),
   last_working_message_id: z.string().nullable().default(null),
   last_status: sessionStatusSchema.default("idle"),
   updated_at: z.string().default(() => new Date().toISOString()),
+})
+
+export const jobStatusSchema = z.enum([
+  "queued",
+  "running",
+  "waiting_approval",
+  "waiting_input",
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+])
+
+export const jobWaitingKindSchema = z.enum([
+  "approval",
+  "input",
+])
+
+export const jobArtifactSchema = z.object({
+  branch: z.string().nullable().default(null),
+  commit: z.string().nullable().default(null),
+  pr_url: z.string().nullable().default(null),
+  artifact_links: z.array(z.string()).default([]),
+})
+
+export const jobRecordSchema = z.object({
+  id: z.string().min(1),
+  bot_name: z.string().min(1),
+  channel_id: z.string().min(1),
+  request_message_ids: z.array(z.string()).default([]),
+  status: jobStatusSchema.default("queued"),
+  thread_id: z.string().nullable().default(null),
+  turn_id: z.string().nullable().default(null),
+  input_text: z.string().default(""),
+  created_at: z.string().default(() => new Date().toISOString()),
+  started_at: z.string().nullable().default(null),
+  finished_at: z.string().nullable().default(null),
+  waiting_kind: jobWaitingKindSchema.nullable().default(null),
+  approval_request_id: z.string().nullable().default(null),
+  result_summary: z.string().nullable().default(null),
+  final_reply: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+  cancel_requested: z.boolean().default(false),
+  artifacts: jobArtifactSchema.default({}),
+})
+
+export const jobQueueSchema = z.object({
+  bot_name: z.string().min(1),
+  active_job_id: z.string().nullable().default(null),
+  pending_job_ids: z.array(z.string()).default([]),
 })
 
 export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>
@@ -71,6 +123,9 @@ export type RegistryConfig = z.infer<typeof registryConfigSchema>
 export type RegistryFile = z.infer<typeof registrySchema>
 export type SessionStatus = z.infer<typeof sessionStatusSchema>
 export type BotSessionState = z.infer<typeof botSessionStateSchema>
+export type JobStatus = z.infer<typeof jobStatusSchema>
+export type JobRecord = z.infer<typeof jobRecordSchema>
+export type JobQueueState = z.infer<typeof jobQueueSchema>
 
 export interface NamedBot {
   name: string

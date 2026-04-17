@@ -164,6 +164,58 @@ export async function startMcpServer() {
   )
 
   server.registerTool(
+    "discord_sentinel_list_jobs",
+    {
+      description: "List jobs for one bot or for all bots.",
+      inputSchema: {
+        bot_name: z.string().optional().describe("Optional bot name filter"),
+      },
+    },
+    async ({ bot_name }) => {
+      return textResult(await service.listJobsForCli(bot_name))
+    },
+  )
+
+  server.registerTool(
+    "discord_sentinel_show_job",
+    {
+      description: "Read the full persisted record for one job.",
+      inputSchema: {
+        job_id: z.string().min(1).describe("Job id"),
+      },
+    },
+    async ({ job_id }) => {
+      return textResult(await service.showJobForCli(job_id))
+    },
+  )
+
+  server.registerTool(
+    "discord_sentinel_cancel_job",
+    {
+      description: "Cancel a queued job or request cancellation for a running job.",
+      inputSchema: {
+        job_id: z.string().min(1).describe("Job id"),
+      },
+    },
+    async ({ job_id }) => {
+      return textResult(await service.cancelJobForCli(job_id))
+    },
+  )
+
+  server.registerTool(
+    "discord_sentinel_retry_job",
+    {
+      description: "Retry a failed, interrupted, or cancelled job by requeueing it.",
+      inputSchema: {
+        job_id: z.string().min(1).describe("Job id"),
+      },
+    },
+    async ({ job_id }) => {
+      return textResult(await service.retryJobForCli(job_id))
+    },
+  )
+
+  server.registerTool(
     "discord_sentinel_get_personality",
     {
       description: "Read the saved per-bot personality instructions.",

@@ -70,4 +70,44 @@ describe("store integration", () => {
     expect(payload.journal).toContain("### Assistant")
     expect(payload.journal).toContain("Hi there")
   })
+
+  test("jobs and queue state persist for a bot", async () => {
+    const home = await mkdtemp(join(tmpdir(), "discord-codex-sentinel-"))
+    tempHomes.push(home)
+
+    const script = `
+      const store = await import(${JSON.stringify(resolve(repoRoot, "src/state/store.ts"))})
+      await store.addBot("queue-bot", { token: "token", label: "Queue Bot", project: "/tmp/project" })
+      const job = await store.createJob({
+        botName: "queue-bot",
+        channelId: "123",
+        inputText: "Do the thing",
+        requestMessageId: "456",
+      })
+      const queue = await store.readJobQueue("queue-bot")
+      queue.pending_job_ids.push(job.id)
+      await store.writeJobQueue(queue)
+      console.log(JSON.stringify({
+        job: await store.readJob(job.id),
+        queue: await store.readJobQueue("queue-bot"),
+      }))
+    `
+
+    const result = Bun.spawnSync({
+      cmd: ["bun", "-e", script],
+      env: {
+        ...process.env,
+        HOME: home,
+      },
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+
+    expect(result.exitCode).toBe(0)
+    const payload = JSON.parse(decoder.decode(result.stdout))
+    expect(payload.job.bot_name).toBe("queue-bot")
+    expect(payload.job.status).toBe("queued")
+    expect(payload.queue.pending_job_ids).toContain(payload.job.id)
+  })
 })
